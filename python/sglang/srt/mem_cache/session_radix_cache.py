@@ -14,6 +14,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# 本文件实现了会话感知的 Radix Cache，通过 session_id 对 KV 缓存进行标记。
+# 每个请求的 KV 节点会被标记上所属的 session_id，多个会话可以共享同一节点。
+# 当关闭会话时，只有在没有其他会话持有该节点时才会释放它（最后持有者释放）。
+# 通过 Mixin 模式混入 RadixCache，提供 _tag_session_leaf 和 release_radix_session 方法。
+
 # Bounded guard against a request finishing after close. If a session id falls
 # out of this LRU after 8192 later closes, an extremely late finish can tag
 # again; explicit register_session clears the tombstone for intentional id reuse.
@@ -27,27 +32,34 @@ class SessionRadixCacheMixin:
     ordinary LRU radix -- no pinning, no open. Mixed into RadixCache."""
 
     def _reset_session_radix_state(self) -> None:
+        """重置会话相关的缓存状态，包括会话叶子节点映射和已关闭会话记录。"""
         self._session_leaves = defaultdict(set)
         self._closed_session_ids = OrderedDict()
 
     def _ensure_session_radix_state(self) -> None:
+        """确保会话状态已初始化，惰性初始化模式。"""
         if not hasattr(self, "_session_leaves"):
             self._reset_session_radix_state()
 
     def _remember_closed_session(self, session_id: str) -> None:
+        """记录已关闭的会话 ID，使用 LRU 策略维护墓碑集合，防止过期请求重新标记。"""
         self._closed_session_ids[session_id] = None
         self._closed_session_ids.move_to_end(session_id)
+        # 超出限制时淘汰最旧的墓碑记录
         while len(self._closed_session_ids) > _CLOSED_SESSION_TOMBSTONE_LIMIT:
             self._closed_session_ids.popitem(last=False)
 
     def _discard_session_leaf(self, node) -> None:
+        """从节点上移除所有会话标记，并更新反向索引。"""
         session_ids = getattr(node, "session_ids", None)
         if not session_ids or not hasattr(self, "_session_leaves"):
             return
+        # 遍历节点上的每个 session_id，从反向索引中移除该节点
         for sid in tuple(session_ids):
             leaves = self._session_leaves.get(sid)
             if leaves is not None:
                 leaves.discard(node)
+                # 如果该会话已无叶子节点且已关闭，则清理索引
                 if not leaves and sid not in self._closed_session_ids:
                     self._session_leaves.pop(sid, None)
         if hasattr(node, "session_ids"):
@@ -55,6 +67,7 @@ class SessionRadixCacheMixin:
 
     def _tag_session_leaf(self, req: Req, radix_key, node=None) -> None:
         """Add this request's session id to its leaf's holder set; no-op for non-session reqs."""
+        # 将请求的 session_id 标记到其对应的叶子节点上，建立会话到节点的反向索引
         if not self.enable_session_radix_cache:
             return
         self._ensure_session_radix_state()
@@ -85,8 +98,11 @@ class SessionRadixCacheMixin:
         """Close: drop this session from each of its tagged leaves, freeing a node
         only once no other session still holds it (last holder). Shared
         prefixes/leaves kept."""
+        # 释放会话：从所有标记的叶子节点中移除该会话，仅在无其他会话持有时释放节点
         self._ensure_session_radix_state()
+        # 将 session_id 加入已关闭墓碑集合
         self._remember_closed_session(session_id)
+        # 获取该会话持有的所有叶子节点
         indexed = self._session_leaves.pop(session_id, set())
         freed = 0
         for leaf in indexed:

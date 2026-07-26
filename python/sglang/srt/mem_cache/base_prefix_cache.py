@@ -23,6 +23,12 @@ from sglang.srt.observability.metrics_collector import (
     resolve_collector_class,
 )
 
+# 本文件定义了前缀缓存(Prefix Cache)的抽象基类和相关数据结构。
+# 所有缓存实现(如 RadixCache)都需要继承 BasePrefixCache 并实现其抽象方法。
+# 文件中还定义了匹配、插入、驱逐、锁引用等操作的参数和结果数据类，
+# 为不同缓存类型提供统一的接口规范。
+# MatchResult 描述了前缀匹配操作的返回结果，包括设备索引和主机命中信息。
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -31,6 +37,8 @@ if TYPE_CHECKING:
     )
 
 
+# PrefixCacheTrait 定义了前缀缓存必须具备的属性接口。
+# 所有实现前缀缓存的类都必须拥有请求到token池、token到KV池分配器、页大小等属性。
 @runtime_checkable
 class PrefixCacheTrait(Protocol):
     req_to_token_pool: ReqToTokenPool
@@ -39,6 +47,9 @@ class PrefixCacheTrait(Protocol):
     disable: bool
 
 
+# MatchPrefixParams 封装了前缀匹配操作所需的参数。
+# key 是用于查找缓存前缀的 RadixKey，包含 token 序列和可选的额外标识。
+# cow_mamba 和 req 是 Mamba 模型特定的参数。
 @dataclasses.dataclass
 class MatchPrefixParams:
     """Unified parameters for match_prefix across different cache types"""
@@ -50,6 +61,11 @@ class MatchPrefixParams:
     req: Optional[Req] = None
 
 
+# InsertParams 封装了缓存插入操作所需的参数。
+# key 和 value 分别是插入的键(token序列)和值(KV缓存索引)。
+# mamba_value 用于 Mamba 模型的状态缓存。
+# prev_prefix_len 和 swa_evicted_seqlen 用于滑动窗口注意力(SWA)场景。
+# chunked 标识是否为分块插入，priority 用于优先级感知的驱逐策略。
 @dataclasses.dataclass
 class InsertParams:
     """Unified parameters for insert across different cache types"""
@@ -69,6 +85,9 @@ class InsertParams:
     priority: int = 0
 
 
+# InsertResult 封装了缓存插入操作的返回结果。
+# prefix_len 表示插入前已存在的前缀长度(即有多少token已被缓存)。
+# last_device_node 指向插入后树中最后匹配的节点，用于后续的锁引用管理。
 @dataclasses.dataclass
 class InsertResult:
     """Result of an insert operation"""
@@ -80,6 +99,9 @@ class InsertResult:
     inserted_host_node: Any = None
 
 
+# EvictParams 封装了缓存驱逐操作的参数。
+# num_tokens 指定需要驱逐的 token 数量，用于释放KV缓存空间。
+# swa_num_tokens 和 mamba_num 分别用于滑动窗口注意力和 Mamba 模型的驱逐。
 @dataclasses.dataclass
 class EvictParams:
     """Unified parameters for evict across different cache types"""
@@ -89,6 +111,8 @@ class EvictParams:
     mamba_num: int = 0
 
 
+# EvictResult 封装了缓存驱逐操作的返回结果。
+# 记录了实际驱逐的 token 数量，供调用方确认释放了多少资源。
 @dataclasses.dataclass
 class EvictResult:
     """Result of an evict operation"""
@@ -152,6 +176,12 @@ class InitLoadBackParams:
     req: Optional[Req] = None
 
 
+# MatchResult 封装了前缀匹配操作的返回结果，是一个命名元组。
+# device_indices 是匹配到的KV缓存在设备上的索引张量。
+# last_device_node 和 last_host_node 分别指向设备和主机上最后匹配的树节点。
+# best_match_node 是所有组件验证器接受的最深节点，作为加载回传的锚点。
+# host_hit_length 表示需要从主机(CPU)加载回设备的 token 数量。
+# swa_host_hit_length 和 mamba_host_hit_length 分别记录滑动窗口注意力和 Mamba 的主机命中数。
 class MatchResult(NamedTuple):
     """Result of a prefix match operation.
 
@@ -208,6 +238,10 @@ def zero_match_result(tree_cache, match_result: MatchResult) -> MatchResult:
     )
 
 
+# BasePrefixCache 是前缀缓存的抽象基类，定义了缓存系统的核心接口。
+# 所有具体的缓存实现（如 RadixCache、ChunkCache）都需要继承此类。
+# 它提供了前缀匹配、插入、驱逐、锁引用管理等核心操作的抽象方法。
+# 同时包含了大小查询、打印、加载回传等辅助方法的默认实现。
 class BasePrefixCache(ABC, PrefixCacheTrait):
     """Cache can be indexed by either rid or key."""
 
@@ -243,10 +277,13 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         tens of seconds (see HostKVCache.destroy). Idempotent.
         """
 
+    # reset 重置缓存到初始状态，清空所有缓存的数据结构和统计信息。
     @abstractmethod
     def reset(self):
         pass
 
+    # match_prefix 在缓存中查找给定 key 的最长匹配前缀。
+    # 返回 MatchResult，包含匹配到的KV缓存索引和最后匹配的节点。
     @abstractmethod
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         pass
@@ -254,28 +291,42 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def supports_fast_match_prefix(self) -> bool:
         return False
 
+    # cache_finished_req 在请求完成时缓存其KV缓存。
+    # 将已完成请求的 token 序列和对应的KV缓存索引插入缓存树中。
+    # 释放请求占用的临时锁引用，并回收已存在于树中的重复部分。
     @abstractmethod
     def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
         pass
 
+    # cache_unfinished_req 在请求尚未完成时缓存其当前的KV缓存。
+    # 用于分块预填充(chunked prefill)场景，允许中间结果被缓存和复用。
+    # 更新请求的前缀索引和锁引用，以便后续继续生成时复用已计算的KV缓存。
     @abstractmethod
     def cache_unfinished_req(self, req: Req, **kwargs):
         pass
 
+    # evict 从缓存中驱逐指定数量的 token 以释放内存空间。
+    # 驱逐策略通常基于LRU(最近最少使用)或优先级，选择最不重要的节点进行清理。
     @abstractmethod
     def evict(self, params: EvictParams) -> EvictResult:
         pass
 
+    # inc_lock_ref 增加节点的锁引用计数，防止该节点被驱逐。
+    # 沿树路径向上遍历，将引用链上所有节点标记为受保护状态。
     @abstractmethod
     def inc_lock_ref(self, node: Any) -> IncLockRefResult:
         pass
 
+    # dec_lock_ref 减少节点的锁引用计数，当计数降为零时节点可被驱逐。
+    # 与 inc_lock_ref 对应，沿树路径向上遍历更新引用计数和可驱逐大小。
     @abstractmethod
     def dec_lock_ref(
         self, node: Any, params: Optional[DecLockRefParams] = None
     ) -> DecLockRefResult:
         pass
 
+    # evictable_size 返回可被驱逐的 token 总数。
+    # 这些 token 当前没有被任何请求引用，可以在内存不足时被回收。
     def evictable_size(self):
         return 0
 
@@ -285,6 +336,8 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def swa_evictable_size(self):
         return 0
 
+    # protected_size 返回受保护的 token 总数。
+    # 这些 token 正被活跃请求引用，不能被驱逐。
     def protected_size(self):
         return 0
 

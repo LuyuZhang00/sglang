@@ -21,6 +21,12 @@ limitations under the License.
 The radix tree data structure for managing the KV cache.
 """
 
+# 本文件实现了基于基数树(Radix Tree)的前缀缓存，用于高效共享KV缓存。
+# RadixCache 通过树形结构存储 token 序列的公共前缀，避免重复计算。
+# 当多个请求具有相同的前缀时，它们可以共享已计算的KV缓存，大幅减少显存占用。
+# 核心数据结构包括 RadixKey(缓存键)、TreeNode(树节点)和 RadixCache(缓存管理器)。
+# 支持前缀匹配、插入、驱逐、锁引用管理等操作，并可配合分页和滑动窗口注意力使用。
+
 import heapq
 import logging
 import sys
@@ -57,6 +63,10 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
 
+# RadixKey 是基数树缓存的键类型，用于标识和匹配 token 序列。
+# token_ids 存储 token ID 序列，extra_key 用于区分不同命名空间(如 LoRA ID)。
+# is_bigram 模式用于 EAGLE 推测解码，将相邻 token 对作为匹配单元。
+# limit 提供了零拷贝的长度限制，避免切片时的内存分配开销。
 class RadixKey:
     """is_bigram=True: token_ids holds raw tokens (N+1 for N bigrams); slices share one boundary token."""
 
@@ -159,6 +169,9 @@ class RadixKey:
                 f"{self.extra_key=} != {other.extra_key=}"
             )
 
+    # match 计算当前 key 与另一个 key 的公共前缀长度。
+    # 使用指数搜索(exponential search)加速长前缀匹配，避免逐 token 比较。
+    # 结果向下取整到 page_size 的倍数，确保页对齐。
     def match(self, other: RadixKey, page_size: int = 1) -> int:
         """Logical-unit prefix length shared with ``other``. Result is rounded down to ``page_size``."""
         self._check_compatible(other)
@@ -195,6 +208,9 @@ class RadixKey:
             return matched_tokens
         return (matched_tokens // page_size) * page_size
 
+    # child_key 生成用于子节点字典查找的哈希键。
+    # 将前 page_size 个逻辑单元转换为可哈希的元组，用于在树节点的 children 字典中快速查找。
+    # 如果存在 extra_key，则将其作为命名空间前缀加入键中。
     def child_key(self, page_size: int = 1):
         """Hashable dict-key for the first ``page_size`` logical units, namespaced by ``extra_key``."""
         t = self.token_ids
@@ -214,6 +230,11 @@ class RadixKey:
         return hash_value
 
 
+# TreeNode 是基数树的节点，存储一个 token 子序列及其对应的KV缓存索引。
+# children 字典存储子节点，parent 指向父节点，形成树形结构。
+# lock_ref 记录当前被多少请求引用，大于零时该节点不会被驱逐。
+# value 存储该节点对应的KV缓存池索引，evicted 属性判断节点是否已被驱逐。
+# last_access_time 和 hit_count 用于驱逐策略的优先级计算。
 class TreeNode:
 
     counter = 0
@@ -223,6 +244,7 @@ class TreeNode:
         self.parent: TreeNode = None
         self.key: RadixKey = None
         self.value: Optional[torch.Tensor] = None
+        # lock_ref 大于零表示节点正在被使用，不可驱逐
         self.lock_ref = 0
         self.last_access_time = time.monotonic()
         self.creation_time = time.monotonic()
@@ -277,6 +299,10 @@ class TreeNode:
         return self.last_access_time < other.last_access_time
 
 
+# RadixCache 是基于基数树的前缀缓存实现，是 SGLang 的核心缓存组件。
+# 它通过树形结构存储 token 序列的公共前缀，实现请求间的KV缓存共享。
+# 当多个请求有相同的前缀时，只需计算一次，后续请求直接复用，大幅提升吞吐量。
+# 支持多种驱逐策略(LRU、LFU、优先级等)和分页分配，适配不同的硬件和场景。
 class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
     def __init__(self, params: CacheInitParams):
         self.disable = params.disable
@@ -328,6 +354,9 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
 
     ##### Public API #####
 
+    # reset 初始化或重置基数树缓存到空状态。
+    # 创建根节点(空key，lock_ref=1确保不被驱逐)，清空可驱逐叶子集合。
+    # 初始化空的匹配结果模板，用于未命中时快速返回。
     def reset(self):
         # Initialize root with minimum priority so any real priority overrides it
         self.root_node = TreeNode(priority=-sys.maxsize)
@@ -352,6 +381,11 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         )
         self._record_all_cleared_event()
 
+    # match_prefix 在基数树中查找给定 key 的最长匹配前缀。
+    # 从根节点开始，沿着 token 序列向下遍历，逐节点比较。
+    # 如果匹配结束在某个节点的中间位置，会将该节点分裂为两个节点。
+    # 返回匹配到的KV缓存索引张量和最后匹配的节点，用于后续的缓存复用。
+    # extra_key 确保不同命名空间(如不同LoRA)的缓存不会错误共享。
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Find the longest cached prefix of ``key`` in the radix tree.
 
@@ -412,6 +446,9 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             best_match_node=last_node,
         )
 
+    # insert 将新的 token 序列和对应的KV缓存索引插入基数树。
+    # 先进行页对齐，然后调用 _insert_helper 执行实际的树操作。
+    # 返回已存在的前缀长度和最后插入的节点，用于后续的缓存管理和锁引用更新。
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
             return InsertResult(prefix_len=0)
@@ -434,6 +471,10 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         )
         return InsertResult(prefix_len=prefix_len, last_device_node=last_node)
 
+    # cache_finished_req 在请求完成时将其KV缓存存入基数树。
+    # 构建 RadixKey 并调用 insert 将 token 序列插入树中。
+    # 释放已存在于树中的重复部分的内存，以及未对齐的尾部。
+    # 最后释放请求的锁引用，使其缓存可被其他请求复用。
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
     ):
@@ -487,6 +528,10 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         if req.last_node is not None:
             self.dec_lock_ref(req.last_node)
 
+    # cache_unfinished_req 在请求尚未完成时缓存其当前的KV缓存状态。
+    # 主要用于分块预填充(chunked prefill)场景，将中间结果存入基数树。
+    # 插入后重新匹配前缀以获取更新后的索引，然后更新请求的前缀索引。
+    # 更新锁引用：释放旧节点，锁定新节点，确保缓存不被意外驱逐。
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""
         if self.disable:
@@ -562,6 +607,10 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
     def total_size(self):
         return self._total_size_helper()
 
+    # evict 从基数树中驱逐指定数量的 token 以释放内存。
+    # 使用最小堆按驱逐策略的优先级排序叶子节点，优先驱逐最不重要的节点。
+    # 驱逐叶子节点后，如果其父节点也变成可驱逐状态，则加入堆中继续驱逐。
+    # 同时记录驱逐事件和性能指标，用于监控和调试。
     def evict(self, params: EvictParams) -> EvictResult:
         if self.disable:
             return EvictResult()
@@ -591,6 +640,9 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)
 
+    # inc_lock_ref 沿节点路径向上增加锁引用计数，保护节点不被驱逐。
+    # 当节点的 lock_ref 从 0 变为 1 时，该节点从可驱逐变为受保护状态。
+    # 同时更新 evictable_size_ 和 protected_size_ 的统计计数。
     def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
         if self.disable:
             return IncLockRefResult(delta=0)
@@ -606,6 +658,9 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             node = node.parent
         return IncLockRefResult(delta=delta)
 
+    # dec_lock_ref 沿节点路径向上减少锁引用计数，释放对节点的保护。
+    # 当节点的 lock_ref 从 1 变为 0 时，该节点从受保护变为可驱逐状态。
+    # 与 inc_lock_ref 配对使用，确保引用计数的正确性。
     def dec_lock_ref(
         self, node: TreeNode, params: Optional[DecLockRefParams] = None
     ) -> DecLockRefResult:
@@ -647,6 +702,10 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
 
     ##### Internal Helper Functions #####
 
+    # _match_prefix_helper 是前缀匹配的核心递归辅助函数。
+    # 从给定节点开始，沿着 key 的 token 序列向下遍历树。
+    # 如果匹配结束在某个节点的中间，调用 _split_node 分裂该节点。
+    # 返回匹配到的KV缓存值列表和最后匹配的节点。
     def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
         access_time = time.monotonic()
         node.last_access_time = access_time
@@ -673,6 +732,10 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
 
         return value, node
 
+    # _split_node 将一个节点在指定位置分裂为两个节点。
+    # 新节点继承原节点的前半部分，原节点保留后半部分。
+    # 这是前缀匹配时的关键操作，当匹配结束在节点中间位置时触发。
+    # 分裂后新节点成为原节点的父节点，保持树结构的正确性。
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int):
         # new_node -> child
         # New node inherits child's priority (represents shared prefix)
@@ -703,6 +766,10 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             return
         node.hit_count += 1
 
+    # _insert_helper 是插入操作的核心递归辅助函数。
+    # 沿树向下遍历，找到与 key 匹配的最长前缀路径。
+    # 如果匹配结束在节点中间，先分裂节点，然后在剩余部分创建新节点。
+    # 新节点被加入树中，更新可驱逐大小和叶子状态。
     def _insert_helper(
         self,
         node: TreeNode,
@@ -776,6 +843,9 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
                     self.page_size
                 ), f"{key=}, {child.key.child_key(self.page_size)=}"
 
+    # _delete_leaf 从树中删除一个叶子节点。
+    # 从父节点的 children 字典中移除该节点，更新可驱逐大小统计。
+    # 同时更新父节点的叶子状态，因为删除子节点可能使父节点变成新的叶子。
     def _delete_leaf(self, node):
         key = node.key.child_key(self.page_size)
         v = node.parent.children.pop(key, None)
@@ -787,6 +857,9 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             self.evictable_leaves.remove(node)
         self._update_leaf_status(node.parent)
 
+    # _update_leaf_status 更新节点的叶子状态，维护可驱逐叶子集合。
+    # 如果节点已被驱逐或有锁引用，则从可驱逐集合中移除。
+    # 如果节点的所有子节点都已被驱逐，则该节点成为新的可驱逐叶子。
     def _update_leaf_status(self, node: TreeNode):
         if node.evicted or node.lock_ref > 0:
             if node in self.evictable_leaves:

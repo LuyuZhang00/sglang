@@ -8,6 +8,12 @@ import torch
 import triton
 import triton.language as tl
 
+# 本文件实现了KV缓存分配的核心逻辑，协调预填充(prefill)和解码(decode)阶段的内存分配。
+# 主要功能包括：为扩展(extend)批次分配KV缓存、为解码批次分配KV缓存、
+# 管理请求槽位分配、以及将缓存索引写入请求到token池的映射。
+# 支持分页分配、滑动窗口注意力(SWA)、以及多种硬件后端(CUDA/NPU/CPU)的适配。
+# 核心入口函数为 alloc_for_extend 和 alloc_for_decode，分别处理预填充和解码场景。
+
 from sglang.kernels.ops.memory.common import (
     get_last_loc_triton,
     get_last_loc_triton_safe,
@@ -52,6 +58,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# write_cache_indices 将分配的缓存位置写入 req_to_token_pool。
+# 对于每个请求，先写入已有的前缀索引，再写入新分配的扩展索引。
+# 根据硬件后端选择 Triton 内核或 Python 循环实现，确保高效的数据写入。
 def write_cache_indices(
     out_cache_loc: torch.Tensor,
     req_pool_indices_tensor: torch.Tensor,
@@ -143,12 +152,17 @@ def get_last_loc_torch(
     )
 
 
+# alloc_token_slots 是底层的 token 槽位分配函数。
+# 首先尝试从树缓存中驱逐足够的空间，然后从分配器中分配指定数量的槽位。
+# 如果分配失败(内存不足)，抛出 RuntimeError 并打印详细的内存状态信息。
+# backup_state 参数用于在分配前备份分配器状态，便于回滚。
 def alloc_token_slots(
     tree_cache: BasePrefixCache,
     num_tokens: int,
     backup_state: bool = False,
 ):
     allocator = tree_cache.token_to_kv_pool_allocator
+    # 先驱逐缓存以释放空间
     evict_from_tree_cache(tree_cache, num_tokens)
 
     state = None
@@ -185,6 +199,10 @@ def _compute_dsv4_state_lens(batch, *, is_decode: bool):
     )
 
 
+# alloc_paged_token_slots_extend 为预填充阶段执行分页式的KV缓存分配。
+# 考虑页对齐的开销，预估需要的token数量(每个多请求可能需要一个新页)。
+# 先驱逐缓存释放空间，然后调用分配器的 alloc_extend 方法执行实际分配。
+# 支持 DSV4-NPU 硬件后端的特殊处理。
 def alloc_paged_token_slots_extend(
     tree_cache: BasePrefixCache,
     prefix_lens: torch.Tensor,
@@ -199,6 +217,7 @@ def alloc_paged_token_slots_extend(
     batch=None,
 ):
     # Over estimate the number of tokens: assume each request needs a new page.
+    # 预估token数量：假设每个请求都需要一个新页，确保分配足够空间
     allocator = tree_cache.token_to_kv_pool_allocator
     num_tokens = extend_num_tokens + len(seq_lens_cpu) * allocator.page_size
     evict_from_tree_cache(tree_cache, num_tokens)
@@ -249,6 +268,10 @@ def alloc_paged_token_slots_extend(
     return (out_cache_loc, state) if backup_state else out_cache_loc
 
 
+# alloc_req_slots 从请求池中分配请求槽位。
+# 对于混合请求池(HybridReqToTokenPool)，还需要处理 Mamba 状态的分配。
+# 如果 Mamba 状态空间不足，会先从树缓存中驱逐以释放空间。
+# 分配失败时抛出 RuntimeError，提示用户减小最大运行请求数。
 def alloc_req_slots(
     req_to_token_pool: ReqToTokenPool,
     reqs: list[Req],
@@ -300,6 +323,10 @@ def _alloc_page_size(batch: ScheduleBatch) -> int:
     return batch.tree_cache.page_size
 
 
+# alloc_for_extend 是预填充(extend)阶段的主分配入口函数。
+# 为批次中的所有请求分配KV缓存槽位，并将缓存索引写入 req_to_token_pool。
+# 支持三种分配模式：KV复用(dLLM)、非分页分配(page_size=1)、分页分配(page_size>1)。
+# 返回分配的缓存位置张量和请求池索引(设备和CPU各一份)。
 def alloc_for_extend(
     batch: ScheduleBatch,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -336,8 +363,10 @@ def alloc_for_extend(
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
     # Allocate KV cache (throws exception on failure)
+    # 根据页大小选择不同的分配策略
     alloc_page_size = _alloc_page_size(batch)
     if reuse_kv is not None and any(reuse_kv):
+        # dLLM 场景：复用已有的KV缓存
         out_cache_loc = _alloc_extend_loc_with_kv_reuse(
             batch,
             reuse_kv,
@@ -348,9 +377,11 @@ def alloc_for_extend(
             alloc_page_size,
         )
     elif alloc_page_size == 1:
+        # 非分页分配：直接分配指定数量的token槽位
         out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
     else:
         # Paged allocation - build last_loc
+        # 分页分配：需要构建 last_loc 用于页边界检测
         last_loc = [
             (t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device))
             for t in prefix_tensors
@@ -369,6 +400,7 @@ def alloc_for_extend(
         )
 
     # Write to req_to_token_pool
+    # 将前缀索引和新分配的缓存位置写入请求到token池的映射
     write_cache_indices(
         out_cache_loc,
         req_pool_indices_device,
@@ -484,6 +516,9 @@ def _alloc_extend_loc_with_kv_reuse(
     return torch.cat(parts)
 
 
+# alloc_paged_token_slots_decode 为解码阶段执行分页式的KV缓存分配。
+# 每个解码步骤只需分配一个token，但考虑页对齐可能需要分配整个页。
+# 调用分配器的 alloc_decode 方法执行实际分配，支持 DSV4-NPU 后端。
 def alloc_paged_token_slots_decode(
     tree_cache: BasePrefixCache,
     seq_lens: torch.Tensor,
@@ -497,6 +532,7 @@ def alloc_paged_token_slots_decode(
     """Allocate paged KV cache for decode batch."""
     allocator = tree_cache.token_to_kv_pool_allocator
     # Over estimate the number of tokens: assume each request needs a new page.
+    # 预估token数量：每个请求可能需要一个新页
     num_tokens = len(seq_lens) * allocator.page_size
     evict_from_tree_cache(tree_cache, num_tokens)
 
@@ -536,6 +572,10 @@ def alloc_paged_token_slots_decode(
     return out_cache_loc
 
 
+# alloc_for_decode 是解码(decode)阶段的主分配入口函数。
+# 为批次中的每个请求分配一个新token的KV缓存槽位。
+# 根据页大小选择非分页或分页分配方式，然后将缓存位置写入 req_to_token_pool。
+# 返回分配的缓存位置张量，供后续的注意力计算使用。
 def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     """
     Allocate KV cache for decode batch and write to req_to_token_pool.
@@ -551,9 +591,11 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
     if _alloc_page_size(batch) == 1:
         # Non-paged allocation
+        # 非分页分配：直接分配 bs * token_per_req 个槽位
         out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
     else:
         # Paged allocation
+        # 分页分配：获取每个请求的最后一个位置，用于页边界检测
         last_loc = batch.req_to_token_pool.req_to_token[
             batch.req_pool_indices, seq_lens_gpu - 1
         ]
@@ -570,6 +612,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         )
 
     # Write to req_to_token_pool
+    # 将新分配的缓存位置写入请求到token池的映射
     if batch.model_config.is_encoder_decoder:
         locs = batch.encoder_lens + seq_lens_gpu
     else:
@@ -587,6 +630,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
             token_per_req,
         )
 
+    # 更新每个请求的已分配KV长度
     for req in batch.reqs:
         req.kv.kv_allocated_len += token_per_req
 

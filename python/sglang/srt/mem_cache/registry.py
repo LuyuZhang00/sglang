@@ -25,9 +25,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# 本文件实现了 Radix Cache 的可插拔工厂注册机制。
+# 通过 register_radix_cache_backend 注册自定义缓存后端，
+# 通过 --radix-cache-backend 命令行参数选择后端。
+# 未指定后端时，default_radix_cache_factory 按优先级链自动选择
+# 最适合当前模型配置的缓存实现。
+
 
 @dataclass
 class TreeCacheBuildContext:
+    """Radix Cache 构建上下文，封装了创建缓存所需的所有参数。"""
     """Radix Cache construction arguments."""
 
     server_args: ServerArgs
@@ -48,10 +55,12 @@ class TreeCacheBuildContext:
 
 RadixCacheFactory = Callable[[TreeCacheBuildContext], BasePrefixCache]
 
+# 全局注册表，存储名称到工厂函数的映射
 _RADIX_CACHE_REGISTRY: dict[str, RadixCacheFactory] = {}
 
 
 def register_radix_cache_backend(name: str, factory: RadixCacheFactory) -> None:
+    """注册一个 Radix Cache 后端工厂函数，名称不可为空或重复。"""
     """Register a radix-cache factory under `name`.
 
     Raises ValueError if `name` is empty/whitespace-only or already
@@ -69,6 +78,7 @@ def register_radix_cache_backend(name: str, factory: RadixCacheFactory) -> None:
 
 
 def get_radix_cache_factory(name: str) -> Optional[RadixCacheFactory]:
+    """根据名称获取已注册的缓存工厂函数，未注册则返回 None。"""
     return _RADIX_CACHE_REGISTRY.get(name)
 
 
@@ -78,9 +88,11 @@ def registered_radix_cache_backends() -> list[str]:
 
 def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     """Built-in Radix Cache selection chain."""
+    # 内置的缓存选择链，按优先级依次判断当前配置，返回最合适的缓存实现
     server_args = ctx.server_args
     params = ctx.params
 
+    # 禁用 Radix Cache 时使用 ChunkCache 系列
     if ctx.effective_chunked_prefill_size is not None and ctx.disable_radix_cache:
         if not ctx.is_hybrid_swa:
             from sglang.srt.mem_cache.chunk_cache import ChunkCache
@@ -195,6 +207,7 @@ def _create_unified_radix_cache(
 
 def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     """Route to the matching factory to construct Radix Cache."""
+    # 创建缓存的顶层入口：优先使用用户指定的后端，否则走默认选择链
     name = ctx.server_args.radix_cache_backend
     if name:
         factory = get_radix_cache_factory(name)

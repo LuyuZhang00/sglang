@@ -31,6 +31,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# 本文件实现了分块预填充缓存（ChunkCache），在禁用 Radix Cache 时使用。
+# ChunkCache 不支持前缀匹配，match_prefix 始终返回空结果；
+# 缓存生命周期与请求生命周期一致，请求结束即释放。
+# 还包含滑动窗口注意力（SWA）变体：SWAChunkCache 和 PureSWAChunkCache。
+
 
 class ChunkCache(BasePrefixCache):
     """
@@ -41,6 +46,7 @@ class ChunkCache(BasePrefixCache):
     """
 
     def __init__(self, params: CacheInitParams):
+        # 初始化请求到 token 映射池和 KV 缓存分配器
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.page_size = params.page_size
@@ -65,6 +71,7 @@ class ChunkCache(BasePrefixCache):
         pass
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
+        # ChunkCache 不支持前缀缓存，始终返回空的匹配结果
         return MatchResult(
             device_indices=torch.empty((0,), dtype=torch.int64),
             last_device_node=None,
@@ -81,6 +88,7 @@ class ChunkCache(BasePrefixCache):
     ):
         # For decode server: if req.output_ids is empty, we want to free all req.origin_input_ids
         # The protected prefix is not this req's to free.
+        # 释放已完成请求的 KV 缓存，跳过受保护的前缀部分
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, req.cache_protected_len : kv_len_to_handle
         ]
@@ -114,9 +122,11 @@ class ChunkCache(BasePrefixCache):
 
 class SWAChunkCache(ChunkCache):
     """ChunkCache with support for sliding window attention."""
+    # 支持滑动窗口注意力的 ChunkCache 变体，用于 SWA 模型
 
     def __init__(self, params: CacheInitParams):
         # DeepSeek V4 HiSparse wraps SWATokenToKVPoolAllocator and exposes the same API.
+        # 验证分配器类型必须是 SWA 或 DeepSeek V4 HiSparse 分配器
         assert isinstance(
             params.token_to_kv_pool_allocator,
             (
@@ -126,6 +136,7 @@ class SWAChunkCache(ChunkCache):
         )
         super().__init__(params)
 
+        # 滑动窗口大小和分块预填充大小
         self.sliding_window_size = params.sliding_window_size
         self.chunked_prefill_size = params.chunked_prefill_size
 
@@ -164,6 +175,7 @@ class PureSWAChunkCache(SWAChunkCache):
         protected_len = req.cache_protected_len
         evict_floor = req.swa_evict_floor
         evicted_seqlen = req.kv.swa_evicted_seqlen
+        # 根据 SWA 窗口淘汰情况，分段释放未被保护且未被窗口淘汰的 KV 索引
         if evicted_seqlen > evict_floor:
             parts = []
             if evict_floor > protected_len:

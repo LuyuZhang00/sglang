@@ -13,6 +13,12 @@
 # ==============================================================================
 """Common utilities."""
 
+# 此文件提供 mem_cache 模块的通用工具函数。
+# 主要功能包括：驱逐策略工厂（支持 LRU/LFU/FIFO 等多种策略的创建与选择）、
+# 自定义内存池初始化（如 Mooncake 分布式场景）、
+# 基于 SHA256 的 KV 缓存块哈希计算与节点分裂时的哈希值拆分。
+# 这些工具被前缀缓存（Radix Cache）和调度器广泛使用。
+
 from typing import Any, Callable, List, Optional, Tuple
 
 from sglang.kernels.ops.kvcache.mla_buffer import (
@@ -52,6 +58,9 @@ from sglang.srt.mem_cache.evict_policy import (
     SLRUStrategy,
 )
 
+# 驱逐策略工厂映射表：将策略名称映射到对应的策略类构造函数。
+# 支持的策略包括 LRU（最近最少使用）、LFU（最不经常使用）、FIFO（先进先出）、
+# MRU（最近最常使用）、FILO（后进先出）、Priority（优先级）和 SLRU（分段LRU）。
 _EVICTION_POLICY_FACTORIES: dict[str, Callable[[], EvictionStrategy]] = {
     "lru": LRUStrategy,
     "lfu": LFUStrategy,
@@ -64,6 +73,9 @@ _EVICTION_POLICY_FACTORIES: dict[str, Callable[[], EvictionStrategy]] = {
 
 
 def get_eviction_strategy(eviction_policy: str) -> EvictionStrategy:
+    # 根据传入的策略名称（如 "lru"、"fifo" 等）创建并返回对应的驱逐策略实例。
+    # 该函数是缓存驱逐策略的统一入口，由前缀缓存初始化时调用。
+    # 若策略名称不在支持列表中，将抛出 ValueError 异常。
     policy = eviction_policy.lower()
     try:
         return _EVICTION_POLICY_FACTORIES[policy]()
@@ -108,6 +120,9 @@ def get_hash_str(
     prior_hash: Optional[str] = None,
     page_size: Optional[int] = None,
 ) -> str | List[str]:
+    # 根据 token ID 序列计算基于 SHA256 的哈希字符串，用于前缀缓存的块标识。
+    # 支持增量哈希：可通过 prior_hash 传入父节点的哈希值以实现位置感知的哈希链。
+    # 当 page_size 大于1时，返回按页分组的哈希值列表。
     prior_digest = bytes.fromhex(prior_hash) if prior_hash else None
     return get_native_hash(token_ids, prior_digest, page_size)
 
@@ -117,6 +132,8 @@ def hash_str_to_int64(hash_str: str) -> int:
 
     Takes first 16 hex characters (64 bits) and converts to signed int64 range.
     """
+    # 将 SHA256 十六进制字符串转换为有符号 64 位整数，用于事件追踪和可观测性指标。
+    # 取前16个十六进制字符（64位）并处理符号位溢出。
     uint64_val = int(hash_str[:16], 16)
     if uint64_val >= 2**63:
         return uint64_val - 2**64
@@ -124,6 +141,9 @@ def hash_str_to_int64(hash_str: str) -> int:
 
 
 def compute_node_hash_values(node: Any, page_size: int) -> List[str]:
+    # 为 Radix 树节点计算位置感知的 SHA256 哈希值列表。
+    # 哈希值考虑了父节点的哈希（确保相同 token 序列在不同位置有不同哈希），
+    # 用于 KV 缓存块的唯一标识和前缀匹配。
     """Compute SHA256-based hash values for position-aware KV block IDs."""
     parent_hash = None
     if node.parent is not None and node.parent.hash_value is not None:
@@ -138,6 +158,8 @@ def compute_node_hash_values(node: Any, page_size: int) -> List[str]:
 def split_node_hash_value(
     child_hash_value: Optional[List[str]], split_len: int, page_size: int
 ) -> tuple[Optional[List[str]], Optional[List[str]]]:
+    # 在 Radix 树节点分裂时，将子节点的哈希值列表拆分为父节点和子节点两部分。
+    # 分裂点由 split_len（token 数）和 page_size 共同决定页边界。
     """Split hash_value between parent and child nodes during node splitting.
 
     Args:

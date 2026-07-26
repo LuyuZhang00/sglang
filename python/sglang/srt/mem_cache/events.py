@@ -30,8 +30,17 @@ from sglang.srt.mem_cache.utils import (
     hash_str_to_int64,
 )
 
+# 本文件实现了 KV 缓存事件追踪机制，供外部消费者（如 KV 感知路由器）使用。
+# 通过 Mixin 模式混入缓存类，在缓存块的存储和移除时发出对应事件。
+# 支持的事件类型包括：BlockStored（块存储）、BlockRemoved（块移除）、
+# AllBlocksCleared（所有块清除）。
+
 
 class KVCacheEventMixin:
+    """KV 缓存事件混入类，为缓存类添加事件记录和导出能力。"""
+
+    def _record_store_event(self, node: Any, medium=None):
+        """记录块存储事件：将节点按 page_size 分页，每页生成一个 BlockStored 事件。"""
     def _record_store_event(self, node: Any, medium=None):
         # One BlockStored per ``page_size`` chunk.
         # ``medium`` defaults to StorageMedium.GPU but callers may override
@@ -84,6 +93,7 @@ class KVCacheEventMixin:
                 page_index += 1
 
     def _record_remove_event(self, node: Any, medium=None):
+        """记录块移除事件：将节点的所有分页哈希值合并为一个 BlockRemoved 事件。"""
         # One BlockRemoved per radix node.
         # ``medium`` defaults to StorageMedium.GPU but callers may override for
         # lower-tier removals (e.g. StorageMedium.CPU when evicting from host).
@@ -112,6 +122,7 @@ class KVCacheEventMixin:
                 )
 
     def _record_all_cleared_event(self):
+        """记录所有块清除事件，通常在缓存重置时调用。"""
         if self.enable_kv_cache_events:
             self.kv_event_queue.append(AllBlocksCleared())
 
@@ -121,6 +132,7 @@ class KVCacheEventMixin:
         Returns:
             A list of KV cache events.
         """
+        # 原子性地取出所有事件并清空队列，供外部消费者（如路由器）轮询
         if not self.enable_kv_cache_events:
             return []
         events = self.kv_event_queue
