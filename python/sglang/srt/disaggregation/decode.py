@@ -897,21 +897,52 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         pp_good_rids: Optional[List[str]] = None,
         pp_bad_rids: Optional[List[str]] = None,
     ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
-        """Pop the preallocated requests from the pending queue (FIFO)."""
+        """从预分配队列中挑选本轮可以进入 KV 传输阶段的请求。
+
+        这个函数位于 Decode 侧 PD 请求生命周期的关键边界：请求已经建立了
+        bootstrap/handshake，但 Prefill 还不知道应该把 KV 写到 Decode 的哪些页。
+        因此这里需要先完成资源准入和目标页预分配，再通过 ``send_metadata`` 把
+        目标页号、状态张量页号以及 Decode 侧前缀命中长度发给 Prefill。
+
+        函数按如下顺序工作：
+
+        1. 汇总 TP/PP rank 上的握手结果，并清理已经失败或被取消的请求；
+        2. 计算 full-KV、SWA、HiCache 恢复区和 HiSparse buffer 的可用预算；
+        3. 按队列顺序（可选优先级顺序）检查请求是否能够安全准入；
+        4. 预分配 req slot、KV 页和 metadata slot，并启动 Decode HiCache 恢复；
+        5. 把接收地址元数据发给 Prefill，随后把请求交给 transfer queue。
+
+        ``preallocated_reqs`` 表示已完成预分配、可以等待 Prefill 写入 KV 的请求；
+        ``failed_reqs`` 表示本轮发现握手失败或已 abort、需要上层回收的请求。
+        未满足握手或资源条件的请求继续留在 ``self.queue``，不会被丢失。
+        """
         is_pp_mode = self.pp_size > 1
+        # PP>1 时每个 pipeline rank 都会观察同一请求；必须使用跨 rank 共识，
+        # 否则某个 rank 单独准入会让各 stage 的请求队列和 KV 地址发生错位。
         if is_pp_mode and (pp_good_rids is None or pp_bad_rids is None):
+            # good/bad 两个集合共同描述 PP 共识结果，缺少任一集合都无法安全决策。
             raise ValueError("PP consensus is required when pp_size > 1")
+            # 直接报错比让不同 PP rank 继续执行更安全，因为后者可能造成通信死锁。
         if is_pp_mode and rids_to_check is not None:
+            # PP 模式必须以共识集合为唯一过滤来源，不能再叠加本 rank 的局部 rid 集合。
             raise ValueError("rids_to_check cannot be used in PP mode")
+            # 禁止混用两种过滤语义，避免各 PP rank 遍历不同的请求子集。
 
         self._resolve_pending_reqs()
+        # 某些 receiver 尚不知道 Prefill DP rank；这里批量解析并初始化其连接端点。
         self._update_handshake_waiters(rids_to_check, pp_good_rids, pp_bad_rids)
+        # 轮询 receiver/PP 共识，把握手完成、失败等状态写回 DecodeRequest。
         if is_pp_mode:
+            # 在 PP 模式下，后续只处理已进入本轮共识结果的 rid。
             rids_to_check = set(pp_good_rids) | set(pp_bad_rids)
+            # good 与 bad 都要扫描：good 参与预分配，bad 则需要在失败清理阶段移除。
 
         failed_reqs = []
+        # 单独返回失败请求，让 scheduler 执行生命周期收尾而不是静默丢弃。
         preallocated_reqs = []
+        # 这里收集已经拿到 Decode 端资源且 metadata 已发送成功的请求。
         indices_to_remove = set()
+        # 先记录索引、最后一次性重建队列，避免遍历过程中删除元素导致索引漂移。
 
         # We need to make sure that the sum of inflight tokens and allocatable tokens is greater than maximum input+output length of each inflight request
         # Otherwise it is possible for one request running decode out of memory, while all other requests are in the transfer queue that cannot be retracted.
@@ -919,13 +950,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             len(r.origin_input_ids) + len(r.output_ids)
             for r in self.scheduler.running_batch.reqs
         )
+        # running batch 可以通过 retract 释放上述 KV。准入计算把它视为应急容量，
+        # 但仍要保证至少一个在途请求能够持续 decode，避免不可回退的 transfer 请求
+        # 占满显存并与 running batch 形成 OOM/等待死锁。
 
         uses_swa_tail_prealloc = self._uses_swa_tail_prealloc()
+        # 分页 SWA allocator 只需为滑窗尾部保留 SWA KV，因此 full 与 SWA 要分开预算。
         swa_allocatable_tokens = 0
+        # 非 SWA-tail 路径不会读取该预算，先置零可保持后续分支变量总是已定义。
         if uses_swa_tail_prealloc:
+            # SWA 池能通过 retract 回收的只是每个请求当前滑窗覆盖的尾部，而非完整序列。
             retractable_swa_tokens = sum(
                 self._swa_retractable_len(r) for r in self.scheduler.running_batch.reqs
             )
+            # 同时计算 full attention 池与 SWA 池预算；任一池不足都不能准入请求。
             full_allocatable_tokens, swa_allocatable_tokens = (
                 self._swa_aware_allocatable_token_budgets(
                     retractable_tokens=retractable_tokens,
@@ -933,103 +971,153 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     count_retracted=True,
                 )
             )
+            # count_retracted=True 会预留 retracted_queue 将来恢复时所需的 KV 空间。
         else:
+            # 普通注意力模型只有一套完整 KV 池，不需要第二套 SWA 物理预算。
             retractable_swa_tokens = 0
+            # 保持变量存在，使后面的 SWA 条件块无需额外的 Optional 分支。
             full_allocatable_tokens = self._allocatable_token_budgets(
                 retractable_tokens=retractable_tokens, count_retracted=True
             )
+            # 预算已包含 active 请求的 decode 余量以及可驱逐 radix cache 页。
         reserved_restore_tokens = self._hicache_pending_restore_tokens()
+        # 已经启动但尚未完成的 L2/L3 -> L1 恢复也会消耗设备页，必须先行预留。
         full_allocatable_tokens -= reserved_restore_tokens
+        # 防止本轮新请求把 HiCache 恢复目标页抢走，造成恢复完成时无处落盘。
         # Sort by priority before any index-based bookkeeping so that both the
         # abort-scan loop and the preallocation loop operate on the same order.
         if self.scheduler.enable_priority_scheduling:
+            # priority 数值的高低语义由配置决定，因此用 sign 统一转换为升序 sort key。
             priority_sign = (
                 1 if self.scheduler.schedule_low_priority_values_first else -1
             )
+            # sign=1 表示较小数值先执行；sign=-1 则把较大数值排到前面。
             self.queue.sort(key=lambda r: r.req.priority * priority_sign)
+            # 必须在记录 indices_to_remove 之前排序，保证两次遍历使用完全相同的索引。
 
         # First, remove all failed requests from the queue
         for i, decode_req in enumerate(self.queue):
+            # 第一遍只负责失败清理；成功请求的资源准入留给下面的第二遍。
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
+                # TP 局部轮询或 PP 共识未覆盖的请求本轮不动，继续等待后续调度周期。
                 continue
             if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
+                # 握手失败会由 _update_handshake_waiters 标记 FINISH_ABORT，用户主动
+                # abort 也走同一路径，因此这里统一完成输出通知和 receiver 清理。
                 if not getattr(decode_req.req, "finished_output", False):
+                    # 若终止结果尚未返回客户端，必须先输出一次，避免请求永久悬挂。
                     self.scheduler.output_streamer.stream_output(
                         [decode_req.req],
                         decode_req.req.return_logprob,
                     )
+                    # return_logprob 保持请求原始输出契约，即使最终结果是错误/取消。
                 decode_req.kv_receiver.clear()
+                # 清理 bootstrap/transfer backend 状态，释放该请求占用的通信资源。
                 decode_req.kv_receiver = None
+                # 显式断开引用，防止后续阶段误用一个已经 clear 的 receiver。
                 failed_reqs.append(decode_req)
+                # 返回给调用方做其余请求级回收和统计。
                 indices_to_remove.add(i)
+                # 延迟到函数末尾统一从 self.queue 删除，保证当前 enumerate 稳定。
 
         # DecodeRequest is shared between self.queue and self.pending_reqs;
         # drop failed reqs from both
         if failed_reqs:
+            # pending_reqs 与 queue 保存同一 DecodeRequest 对象，而不是对象副本。
             failed_ids = {id(r) for r in failed_reqs}
+            # 使用对象 identity 而不是 rid，避免重复 rid 或 Req 自定义相等语义误删。
             self.pending_reqs = [
                 r for r in self.pending_reqs if id(r) not in failed_ids
             ]
+            # 否则后续 _resolve_pending_reqs 可能重新初始化已经失败的 receiver。
 
         # HiSparse physical constraint: max requests by device buffer capacity.
         # Each admitted req needs padded_buffer_size from hisparse device pool.
         # waiting_queue reqs already have device buffers (allocated in admit_request_direct),
         # only transfer_queue reqs are pending device buffer allocation.
         hisparse_req_budget = float("inf")
+        # 非 HiSparse 路径没有“每请求一个 padded device buffer”的约束，用无穷大
+        # 让统一的准入循环无需额外分叉。
         if self.scheduler.enable_hisparse:
+            # HiSparse attention 的设备 buffer 与普通 logical KV 页是不同的物理资源。
             hisparse_avail = (
                 self.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size()
             )
+            # available_size 按 token/slot 计量，要除以每请求固定的 padded buffer 大小。
             hisparse_req_budget = max(
                 0,
                 hisparse_avail // self.scheduler.hisparse_coordinator.padded_buffer_size
                 - len(self.transfer_queue.queue),
             )
+            # transfer_queue 中的请求尚未拿到这块 device buffer，也要提前占用名额；
+            # max(0, ...) 避免历史在途量导致负预算并污染后面的递减逻辑。
 
         # Then, preallocate the remaining requests if possible
         for i, decode_req in enumerate(self.queue):
+            # 第二遍严格按 FIFO 或优先级顺序准入；遇到共享资源不足时会 break，
+            # 从而避免后来的请求越过队首，破坏调度公平性。
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
+                # 该请求没有本轮可用的 handshake/PP 共识结果，暂时留在队列。
                 continue
 
             if i in indices_to_remove:
+                # 第一遍已判定失败的条目只等待统一删除，不能再进行资源分配。
                 continue
 
             if not decode_req.waiting_for_input:
+                # Prefill 尚未进入 WaitingForInput 时不能发送目标页 metadata，
+                # 否则 Decode 与 Prefill 的 bootstrap 状态机会发生乱序。
                 continue
 
             if self.req_to_token_pool.available_size() <= 0:
+                # 每个准入请求至少需要一个 req slot 保存 token -> KV 页映射。
                 break
+                # req slot 是全局硬约束，后续请求同样无法绕过，因此直接停止扫描。
 
             if self.req_to_metadata_buffer_idx_allocator.available_size() <= 0:
+                # metadata slot 用于传输 backend 的同步/辅助数据，KV 页充足也不能缺它。
                 break
+                # allocator 没有空位时所有后续请求都会失败，所以保持 FIFO 并退出。
 
             if hisparse_req_budget <= 0:
+                # HiSparse 的按请求物理 buffer 名额耗尽，不能再接收新的 KV transfer。
                 break
+                # 该约束与请求长度无关，检查后续短请求也没有意义。
 
             # Memory estimation: don't add if the projected memory cannot be met
             # TODO: add new_token ratio
             origin_input_len = self._rebootstrap_prefill_len(decode_req.req)
+            # 普通请求只传原 prompt；true rebootstrap 还要让 Prefill 重算已有输出 token。
             prefix_match: Optional[DecodePrefixMatch] = None
+            # 默认没有 Decode 侧命中；成功匹配后对象还承载锁定节点和 HiCache 恢复信息。
             use_decode_radix_cache = (
                 self.scheduler.server_args.disaggregation_decode_enable_radix_cache
                 and not decode_req.is_rebootstrap
             )
+            # rebootstrap 必须按当前权重重算完整前缀，不能复用可能由旧权重生成的缓存。
             if use_decode_radix_cache:
                 # Match prefix against decode's radix cache.
                 prefix_match = self._match_prefix_and_lock(decode_req.req)
+                # 匹配函数会增加 radix 节点 lock ref，保证准入决策期间命中页不被驱逐。
                 prefix_indices = prefix_match.prefix_indices
+                # 这些是已经位于 Decode GPU(L1) 的前缀页，可直接写入 req_to_token 映射。
                 # prefix_len: tokens already on device (L1 hit).
                 # total_prefix_len: full prefix promised to prefill
                 # (L1 + L2 host hit + L3 storage hit), sent as PD
                 # protocol's `decode_prefix_len`. The [prefix_len, total)
                 # gap is filled by HiCache loadback later.
                 prefix_len = prefix_match.l1_prefix_len
+                # prefix_len 只计算当前已在设备上的连续命中，决定实际还需分配多少 L1 页。
                 total_prefix_len = prefix_match.decode_prefix_len
+                # total_prefix_len 还包含 L2/L3 命中；Prefill 会跳过这段，Decode 后续自行恢复。
 
                 fill_len = self._pre_alloc_fill_len(decode_req.req)
+                # fill_len 是接收 Prefill KV 后应当已经 committed 的 token 数，通常不含
+                # 最后一个尚未执行 forward、仅刚采样出的 output token。
                 required_alloc_tokens = self._required_alloc_tokens(
                     fill_len=fill_len, prefix_len=prefix_len
                 )
+                # 按 allocator page size 向上取页，计算 L1 命中之外仍需占用的真实物理量。
                 # Matching may lock previously-evictable radix pages, so refresh
                 # the admission budget against the post-lock pool state before we
                 # decide whether this request still fits.
@@ -1039,15 +1127,22 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     extra_reserved_reqs=len(preallocated_reqs),
                     hicache_reserved_tokens=reserved_restore_tokens,
                 )
+                # radix 匹配刚锁住的页原本可能是 evictable，旧预算已不准确，必须重算。
             else:
                 prefix_indices = None
+                # 不使用 Decode radix cache 时，req_to_token 前缀没有可复用页号。
                 prefix_len = 0
+                # L1 命中长度为零，因此整个 fill 区间都要新分配。
                 total_prefix_len = 0
+                # 也不会向 Prefill 宣称 Decode 能从 L2/L3 恢复任何前缀。
                 required_alloc_tokens = self._pre_alloc_fill_len(decode_req.req)
+                # 无 prefix 且传统 token allocator 下，所需 token 数就是完整 fill 长度。
 
             required_tokens_for_request = (
                 required_alloc_tokens + self.num_reserved_decode_tokens
             )
+            # 除接收 prompt KV 外，还为刚准入请求预留若干 decode token，避免它一进入
+            # running batch 就因没有生成空间而立即触发 retraction。
 
             if (
                 max(
@@ -1062,21 +1157,36 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
                 > full_allocatable_tokens
             ):
+                # 第一项保证当前请求能完成预分配；第二项保证最坏情况下仍能通过
+                # retract running batch 为其腾出“prompt 剩余 + 最大输出”所需空间。
+                # 取 max 是为了同时覆盖立即分配安全和长期 decode 可推进性。
                 if prefix_len > 0:
+                    # 本请求未获准进入 transfer queue，必须撤销前面 radix match 加的锁。
                     self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    # 不解锁会让命中节点永久不可驱逐，逐轮侵蚀可用 KV 容量。
                 break
+                # full pool 是队列共享硬约束；为保持顺序，不让后续请求越过当前请求。
             if required_tokens_for_request > full_allocatable_tokens:
+                # 这是一个显式的即时容量保护。它与上面的 max 条件看似重复，但保留
+                # 独立检查可清晰约束“预分配 + decode reserve”绝不能超过当前预算。
                 if prefix_len > 0:
+                    # 与所有准入失败路径一样，归还此次 prefix match 持有的 radix 锁。
                     self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    # last_node 是 _match_prefix_and_lock 保存到 Req 上的设备命中节点。
                 break
+                # 当前请求无法分配时，停止 FIFO 扫描，等待回收或下一调度周期。
 
             if uses_swa_tail_prealloc:
+                # hybrid SWA 模型还要独立验证 SWA 尾部池，full KV 足够并不代表 SWA 足够。
                 _, swa_required = self._prealloc_required_tokens(decode_req.req)
+                # swa_required 包含当前滑窗尾部和必要的后续 decode reserve。
                 _, swa_len = self._prealloc_kv_lens(decode_req.req)
+                # swa_len 是本次 prompt/rebootstrap 真正需要落到 SWA 池的有效尾部长度。
                 max_new_tokens = min(
                     decode_req.req.sampling_params.max_new_tokens,
                     CLIP_MAX_NEW_TOKEN,
                 )
+                # 用全局上限截断用户配置，避免不现实的超大 max_new_tokens 阻塞所有请求。
                 if (
                     max(
                         swa_required,
@@ -1084,20 +1194,29 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     )
                     > swa_allocatable_tokens
                 ):
+                    # 同 full pool：同时检查即时分配量和 retract 后完成生成的最坏需求。
                     if prefix_len > 0:
+                        # SWA 预算失败也意味着整个请求未准入，必须释放 radix 节点锁。
                         self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                        # 即便命中页位于 full pool，失败路径仍不能保留其保护引用。
                     break
+                    # SWA buffer 是共享硬资源，因此不跳过队首去尝试后续请求。
 
             if total_prefix_len != 0 and hasattr(
                 self.token_to_kv_pool_allocator, "c4_attn_allocator"
             ):
+                # DSV4 NPU chunked-prefill/C4 allocator 尚不能表达 Decode 侧前缀复用的
+                # 多池映射；若继续，Prefill 跳过的 prefix 将无法正确写回 Decode。
                 if prefix_len > 0:
+                    # 抛错前撤销 radix match 的锁，避免异常被上层捕获后留下资源泄漏。
                     self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    # total_prefix_len 可能仅来自 L2/L3，而 prefix_len>0 才实际持有 L1 锁。
                 raise RuntimeError(
                     "DSV4 NPU PD disaggregation does not support decode-side "
                     "prefix cache yet; disable disaggregation decode radix/HiCache "
                     "for PD + chunked prefill."
                 )
+                # 明确拒绝不受支持的组合，比生成错误 KV 或错误 token 更容易定位问题。
 
             dst_kv_indices = self._pre_alloc(
                 decode_req.req,
@@ -1105,28 +1224,42 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 prefix_len,
                 total_prefix_len,
             )
+            # 真正分配 req slot 和 KV 目标页，并把 L1 命中页写进 req_to_token 映射；
+            # 返回值在 HiSparse 下还用于构造 direct-to-host 的目标索引。
             decode_req.prefix_match = prefix_match
+            # transfer 阶段需要此对象判断 HiCache 恢复是否完成，并在结束时管理锁引用。
             if self.scheduler.enable_decode_hicache:
+                # 只有 Decode HiCache 完整开启时才需要把 L2/L3 命中区恢复到 L1。
                 self._start_hicache_prefetch(decode_req.req, prefix_match)
+                # 恢复与 Prefill 计算/传输并行启动，以隐藏远端或 host cache 读取延迟。
             hisparse_req_budget -= 1
+            # 非 HiSparse 时预算为 inf，递减后仍为 inf；HiSparse 时消耗一个请求名额。
             # Recompute from actual pool state for the next queue entry.
             # This accounts for page rounding and newly locked evictable cache.
             if prefix_match is not None:
+                # 已启动恢复的 token 未来要占据本轮预分配的目标页，加入全局恢复预留量。
                 reserved_restore_tokens += prefix_match.restore_token_count
+                # 后续请求预算必须看见该占用，不能把同一恢复空间重复承诺出去。
             full_allocatable_tokens = self._allocatable_token_budgets(
                 retractable_tokens=retractable_tokens,
                 count_retracted=True,
                 extra_reserved_reqs=len(preallocated_reqs) + 1,
                 hicache_reserved_tokens=reserved_restore_tokens,
             )
+            # 使用 allocator 的实际状态重算而非简单减 token 数，因为分页向上取整、
+            # radix 锁变化和 evictable size 都可能让理论差值与真实容量不同。
             if uses_swa_tail_prealloc:
                 # SWA budget uses simple decrement (no radix cache eviction in
                 # the SWA pool, so page-rounding drift is negligible).
                 swa_allocatable_tokens -= swa_required
+                # SWA 池没有 radix 驱逐/锁状态变化，可用已计算的物理需求直接递减。
             decode_req.req.cache_protected_len = total_prefix_len
+            # 标记这段前缀已由 Decode 命中承诺，后续 cache/release 逻辑不能提前覆盖它。
 
             page_size = self.token_to_kv_pool_allocator.page_size
+            # allocator page size 用于把 token 索引压缩成传输协议中的页索引。
             kv_transfer_page_size = page_size
+            # 普通路径传输页大小与设备 allocator 一致；HiSparse 会在下方改成压缩页大小。
             if self.scheduler.enable_hisparse:
                 # Direct-to-host sends host/C4 rows; keep allocator.page_size
                 # logical and use the compressed page size only for these indices.
@@ -1135,16 +1268,22 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     "hisparse_page_size",
                     page_size,
                 )
+                # 某些 allocator 暂无专用属性时回退到普通 page_size，保持兼容性。
                 kv_indices = dst_kv_indices[: origin_input_len - prefix_len]
+                # HiSparse 直接写 host/C4 目标，只发送本次 Prefill 需要填充的有效区间。
             else:
                 # Only send delta indices (beyond prefix) to prefill.
                 kv_indices = self.req_to_token_pool.req_to_token[
                     decode_req.req.req_pool_idx
                 ][total_prefix_len:origin_input_len]
+                # Prefill 已收到 decode_prefix_len，会跳过 Decode 的 L1/L2/L3 命中；
+                # 因此这里只回传 [total_prefix_len, prompt_len) 的增量目标页。
 
             seq_len = origin_input_len
+            # 下方各类模型状态 payload 都必须以同一个逻辑序列长度构造，确保 P/D 对齐。
 
             def _mamba_payload():
+                # Mamba state 按 request slot 而非普通 KV page 编址，需要独立映射。
                 return [
                     self.req_to_token_pool.req_index_to_mamba_index_mapping[
                         decode_req.req.req_pool_idx
@@ -1152,57 +1291,85 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     .cpu()
                     .numpy()
                 ]
+                # ZMQ 元数据需要 CPU numpy；外层 list 与 state transfer 接口的分段格式一致。
 
             def _swa_payload():
+                # SWA 只传当前窗口覆盖的页，窗口之前的 KV 已不参与后续 attention。
                 window_size = self.scheduler.sliding_window_size
+                # 使用 scheduler 的模型级窗口配置，保证与实际 forward attention 一致。
                 window_start = max(0, seq_len - window_size)
+                # 短序列从 0 开始，长序列只保留最后 window_size 个 token。
                 window_start = page_align_floor(window_start, page_size)
+                # 向下页对齐以包含跨页窗口边界，避免漏传窗口首 token 所在的整页。
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
                     decode_req.req.req_pool_idx, window_start:seq_len
                 ]
+                # req_to_token 保存的是 full-pool 逻辑索引，先截取窗口的连续位置。
                 window_kv_indices_swa = (
                     self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
                         window_kv_indices_full
                     )
                 )
+                # hybrid allocator 的 SWA 池有独立物理编号，必须从 full 编号翻译后再发送。
                 return kv_to_page_indices(window_kv_indices_swa, page_size)
+                # 协议按页传输，压缩为每页一个索引以减少 bootstrap metadata 体积。
 
             def _dsa_payload():
+                # DSA/indexer 状态与主 KV 共用 device page location，但需要单独声明状态类型。
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     decode_req.req.req_pool_idx, :seq_len
                 ]
+                # DSA 需要完整逻辑序列的页位置，不能像主 KV 一样只传 prefix 之后的 delta。
                 # Indexer lives on device pool; always use device page_size
                 device_page_size = self.token_to_kv_pool.page_size
+                # HiSparse 主传输可能使用 host 压缩页，indexer 仍驻留设备，页大小不能混用。
                 return kv_to_page_indices(kv_indices_full, device_page_size)
+                # 结果与 Prefill 侧相同 state type 的 source page 顺序一一对应。
 
             def _swa_ring_payload():
                 # Mirror of prefill _swa_ring_payload using this side's req_pool_idx.
                 # Same window positions and order -> positional match with prefill.
                 ring_stride = self.token_to_kv_pool.unified_swa_ring_size
+                # 每个 request slot 在统一 SWA ring 中占用固定 stride 的行区间。
                 window_size = self.token_to_kv_pool.unified_swa_window
+                # ring 使用 KV pool 的实际窗口配置，而不是假定与普通 SWA payload 相同。
                 window_start = max(0, seq_len - window_size)
+                # 只为仍在滑窗中的 token 构造 ring row，旧位置已经可以被循环覆盖。
                 positions = np.arange(window_start, seq_len, dtype=np.int64)
+                # 显式 int64 防止长序列位置计算时溢出；最终传输前再压成 int32。
                 state_slot = int(decode_req.req.req_pool_idx)
+                # req_pool_idx 决定该请求在全局 ring buffer 中的独立基址。
                 ring_rows = state_slot * ring_stride + (positions % ring_stride)
+                # 取模实现环形复用，加 slot 基址保证不同请求的 ring 行互不重叠。
                 return ring_rows.astype(np.int32)
+                # state metadata 使用紧凑 int32，且与接收端索引 dtype 保持一致。
 
             def _c128_state_payload():
+                # DSV4 C128 state 在线与离线模式的 ring 编址不同，需要运行时选择。
                 online = is_dsv4_c128_online_enabled()
+                # online 模式只维护当前 state，因此逻辑 ring size 固定为 1。
                 ring_size = 1 if online else self.token_to_kv_pool.get_ring_size(128)
+                # offline 模式从 KV pool 获取真实 C128 ring 大小，避免硬编码模型布局。
                 return get_dsv4_c128_state_indices(
                     int(decode_req.req.req_pool_idx),
                     seq_len,
                     online=online,
                     ring_size=ring_size,
                 )
+                # helper 同时编码 request slot、序列进度和模式，返回 P/D 对齐的 state 行号。
 
             state_types = self.kv_manager.kv_args.state_types
+            # transfer backend 在初始化时根据模型注册需要随主 KV 一起传输的额外状态类型。
             if StateType.C128_STATE in state_types:
+                # C128 buffer 可能复用旧 request slot；接收新状态前要先清除残留的 ring 内容。
                 clear_c128_state = getattr(
                     self.token_to_kv_pool, "clear_c128_req_state", None
                 )
+                # getattr 允许不实现该清理接口的兼容 KV pool 继续工作。
                 if clear_c128_state is not None:
+                    # 仅在 pool 明确提供清理能力时执行，避免对通用 KVCache 做类型假设。
                     clear_c128_state(int(decode_req.req.req_pool_idx))
+                    # 以本次刚分配的 req slot 为粒度清理，不影响其他并发请求。
             # MINIMAX_INDEX_K reuses _dsa_payload: index rows live at the same loc
             # as main KV on the same page_size.
             payloads = {
@@ -1213,19 +1380,26 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 StateType.SWA_RING: _swa_ring_payload,
                 StateType.C128_STATE: _c128_state_payload,
             }
+            # 使用“状态类型 -> 延迟构造函数”映射，只计算当前模型真正声明的 payload，
+            # 避免无关模型访问不存在的 pool 属性或做不必要的 GPU->CPU 索引复制。
             if hasattr(self.req_to_token_pool, "req_to_token_c4"):
+                # req_to_token_c4 标识 DSV4 NPU 的多池页表；该组合目前只支持无前缀命中。
                 # DSV4 on NPU: per-pool dst page indices, produced by the same
                 # shared builder prefill uses so src/dst line up positionally.
                 if total_prefix_len != 0:
+                    # 这里再次防御是因为 state payload 构造必须与 Prefill 的 source 排列一致。
                     raise RuntimeError(
                         "DSV4 NPU PD disaggregation does not support decode-side "
                         "prefix cache yet; disable disaggregation decode radix/HiCache "
                         "for PD + chunked prefill."
                     )
+                    # 若允许继续，C4/C128 各池的 prefix offset 会不一致并写错目标状态。
             if _is_npu and isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
+                # DSV4 NPU 还有通用字典未覆盖的专用 state pools，按平台惰性导入 helper。
                 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
                     dsv4_state_payloads,
                 )
+                # 局部 import 避免 CUDA/其他硬件环境加载 NPU 专用模块及其依赖。
 
                 payloads.update(
                     dsv4_state_payloads(
@@ -1237,24 +1411,33 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         prefix_len=total_prefix_len,
                     )
                 )
+                # shared builder 同时被 Prefill/Decode 使用，保证每种 DSV4 state 的
+                # source/destination 页列表在长度、顺序和 prefix offset 上严格对齐。
             state_indices: Optional[List] = [
                 payloads[st]() if st in payloads else None for st in state_types
             ]
+            # 顺序必须严格跟随 kv_args.state_types；None 表示该 state type 无额外索引，
+            # backend 会采用默认布局或跳过，而不能打乱其他 state 的位置。
 
             decode_req.metadata_buffer_index = (
                 self.req_to_metadata_buffer_idx_allocator.alloc()
             )
+            # 每个在途请求独占一个 metadata buffer slot，供传输完成信号和辅助数据使用。
             assert decode_req.metadata_buffer_index is not None
+            # 前面已检查 available_size；这里失败说明估算与 allocator 状态不同步，是内部 bug。
             # int32 for ZMQ serialization -- from_zmq reads np.int32.
             page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size).astype(
                 np.int32
             )
+            # 把 token location 压成页首索引，并固定为接收端 ZMQ 反序列化期待的 int32。
             device_page_indices = None
+            # 只有 HiSparse DSV4 同时具有 host C4 页和 device logical 页，普通路径不需要它。
             if (
                 self.scheduler.enable_hisparse
                 and isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
                 and not _is_fake_transfer(decode_req.req, self.scheduler.server_args)
             ):
+                # fake backend 不进行真实 RDMA，也不需要携带第二套 device 目标页信息。
                 # alloc_logical_only() already allocated the shared logical pages
                 # used by C4 indexer and C128 KV. These device buffers do not use
                 # the C4 sparse physical-slot mapping; carry their logical page IDs
@@ -1263,48 +1446,67 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     decode_req.req.req_pool_idx,
                     prefix_len:origin_input_len,
                 ]
+                # device states 使用 logical full-KV 页表；切掉 L1 prefix 后只传本轮增量区间。
                 device_page_indices = kv_to_page_indices(
                     full_kv_indices,
                     page_size,
                 ).astype(np.int32)
+                # device pool 必须使用原 allocator page_size，不能使用 host C4 压缩页大小。
                 if self.transfer_backend != TransferBackend.MOONCAKE:
+                    # 当前只有 Mooncake backend 实现了同时携带 host/device 两套目标页的协议。
                     raise NotImplementedError(
                         "DSV4 HiSparse direct PD transfer currently requires "
                         "the Mooncake backend"
                     )
+                    # 及早拒绝其他 backend，防止它们忽略 device_kv_indices 后写入错误地址。
             metadata_kwargs = {"decode_prefix_len": total_prefix_len}
+            # 告诉 Prefill：Decode 已承诺拥有 [0, total_prefix_len) 的 KV，P 只需发送 delta。
             if device_page_indices is not None:
+                # HiSparse DSV4 的 device-resident states 需要第二套目标页号。
                 metadata_kwargs["device_kv_indices"] = device_page_indices
+                # 通过 kwargs 扩展协议，使普通 backend/模型不承担无关字段。
             if (
                 self.transfer_queue.enable_staging
                 and hasattr(decode_req.kv_receiver, "require_staging")
                 and decode_req.kv_receiver.require_staging
             ):
+                # heterogeneous TP 可能要求先把 Prefill KV 写入 staging，再重排到最终 KV pool。
                 # Register before send_metadata, which triggers the STAGING_REQ
                 # prefetch (dropped for an unregistered room); tiny race, correct order.
                 self.transfer_queue.staging_handler.register_decode_req(
                     decode_req.req.bootstrap_room, decode_req
                 )
+                # 必须先按 bootstrap_room 注册：send_metadata 会立即触发对端的 staging 请求，
+                # 如果消息先到而本地映射尚不存在，该请求会被当作未知 room 丢弃。
             decode_req.kv_receiver.send_metadata(
                 page_indices,
                 decode_req.metadata_buffer_index,
                 state_indices,
                 **metadata_kwargs,
             )
+            # 这是预分配阶段的提交点：Prefill 收到目标页后即可向 Decode 发起真实 KV 写入。
             if decode_req.is_rebootstrap:
+                # true rebootstrap 不是普通 prompt 请求；它要求原 Prefill worker 用当前权重
+                # 重算 prompt + 已生成 token 的 KV，因此 metadata 之后再提交重算任务。
                 self.kv_manager.submit_prefill_recompute(
                     decode_req.kv_receiver,
                     decode_req.req.build_rebootstrap_payload(),
                 )
+                # payload 携带恢复生成所需的完整逻辑输入；复用已建立的 receiver 保证路由一致。
             preallocated_reqs.append(decode_req)
+            # 调用方会把这些请求移入 transfer queue，等待 Prefill 完成数据传输。
             indices_to_remove.add(i)
+            # 已提交 metadata 的请求不能继续留在 prealloc queue，否则下一轮会重复分配/发送。
             decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
+            # 记录进入 transfer 阶段的时间，用于拆分握手、排队和 KV 传输延迟指标。
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
+        # 一次性移除失败和已预分配条目；未握手或资源不足的请求保持原相对顺序等待下轮。
 
         return preallocated_reqs, failed_reqs
+        # 返回值把“可进入 transfer”和“需要失败收尾”分流，队列中剩余请求无需返回。
 
     @property
     def num_tokens_pre_allocated(self):
