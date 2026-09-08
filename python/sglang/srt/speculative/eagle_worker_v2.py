@@ -1153,33 +1153,45 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def forward_batch_generation(
         self, batch: ScheduleBatch, on_publish=None, grammar_barrier=None
     ):
+        # 根据当前批次类型分别处理提示词扩展和 token 生成。
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill
+            # 除独立模式会丢弃隐藏状态外，捕获目标模型的全部隐藏状态。
             target_capture_mode = (
                 CaptureHiddenMode.NULL
                 if self.speculative_algorithm.is_standalone()
                 else CaptureHiddenMode.FULL
             )
+            # 使用目标模型处理提示词扩展。
             batch_output = self.target_worker.forward_batch_generation(
                 batch, capture_hidden_mode=target_capture_mode
             )
 
             # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
             # Extend processed L prompt tokens; next verify iter expects same L.
+            # 保留扩展前的序列长度，供下一轮推测使用。
             batch_output.new_seq_lens = batch.seq_lens
             # Publish before draft_extend so the fence is at target-end.
+            # 目标模型计算完成后立即通知重叠调度器。
             if on_publish is not None:
+                # 发布用于标记目标模型计算范围的序列长度。
                 on_publish(batch_output.new_seq_lens)
 
             # Draft prefill
+            # 在 draft 模型和推测 MoE 上下文中执行 draft 扩展。
             with (
+                # 将 collective 操作切换到 draft 的张量并行组。
                 self.draft_worker.draft_tp_context(
                     self.draft_worker.draft_runner.tp_group
                 ),
+                # 为本次前向计算选择推测 MoE 后端。
                 speculative_moe_backend_context(),
+                # 为本次前向计算选择推测 MoE all-to-all 后端。
                 speculative_moe_a2a_backend_context(),
+                # 将本段计算归入 draft-extend 性能分析阶段。
                 spec_stage_span("draft_extend"),
             ):
+                # 使用 draft logits、隐藏状态和 token 初始化下一轮迭代。
                 batch_output.next_draft_input = (
                     self.draft_worker._draft_extend_for_prefill(
                         batch,
@@ -1188,19 +1200,25 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         batch_output.logits_output.mm_input_embeds,
                     )
                 )
+                # 返回目标模型结果以及准备好的 draft 状态。
                 return batch_output
         else:
+            # 让自适应推测机制为当前批次选择生效的步数。
             self.activate_step_by_batch(batch.seq_lens.shape[0])
 
+            # 尚未附加 draft 状态时，初始化一个 idle 输入。
             if batch.spec_info is None:
+                # idle 批次仍需有效的隐藏状态描述信息以参与 collective 操作。
                 capture_mode = (
                     CaptureHiddenMode.NULL
                     if self.speculative_algorithm.is_standalone()
                     else CaptureHiddenMode.LAST
                 )
+                # 查询 draft 模型所需循环状态的形状和数据类型。
                 hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(
                     self.draft_worker.draft_runner
                 )
+                # 为当前批次创建形状有效的推测输入。
                 batch.spec_info = EagleDraftInput.create_idle_input(
                     device=self.device,
                     hidden_size=hidden_size,
@@ -1209,42 +1227,64 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     capture_hidden_mode=capture_mode,
                     vocab_size=self.target_worker.model_config.vocab_size,
                 )
+            # 自适应调度禁用推测时，跳过 draft 生成。
             if self.speculative_num_steps == 0:
                 # Drafting disabled (high batch size). _draft_extend below still
                 # runs, keeping draft KV warm for when the batch shrinks.
+                # 构建一个表现为普通解码的一节点验证树。
                 verify_input = self._build_trivial_verify_input(batch)
             else:
+                # 在 draft 侧上下文中生成推测 draft 树。
                 with (
+                    # 将 collective 操作切换到 draft 的张量并行组。
                     self.draft_worker.draft_tp_context(
                         self.draft_worker.draft_runner.tp_group
                     ),
+                    # 为本次前向计算选择推测 MoE 后端。
                     speculative_moe_backend_context(),
+                    # 为本次前向计算选择推测 MoE all-to-all 后端。
                     speculative_moe_a2a_backend_context(),
+                    # 将本段计算归入 draft 性能分析阶段。
                     spec_stage_span("draft"),
                 ):
+                    # 根据 draft 提议生成验证输入。
                     verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
+            # verify 路径要求使用专用的验证输入类型。
             assert verify_input.is_verify_input()
+            # 在目标模型验证前附加 draft 提议。
             batch.spec_info = verify_input
+            # 使用目标模型验证推测树。
             batch_output = self.verify(batch, grammar_barrier=grammar_barrier)
             # Publish before draft_extend so the fence is at verify-end.
+            # 目标模型验证完成后通知重叠调度器。
             if on_publish is not None:
+                # 发布用于标记验证计算范围的序列长度。
                 on_publish(batch_output.new_seq_lens)
+            # 在零步推测时，根据配置决定是否省略 draft 扩展。
             if (
                 self.speculative_num_steps == 0
                 and envs.SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND.get()
             ):
+                # 使用形状有效但不会被消费的占位数据填充下一轮 draft 输入。
                 self._stub_skipped_draft_extend(batch, batch_output)
             else:
+                # 扩展 draft KV cache，为下一轮生成做准备。
                 with (
+                    # 将 collective 操作切换到 draft 的张量并行组。
                     self.draft_worker.draft_tp_context(
                         self.draft_worker.draft_runner.tp_group
                     ),
+                    # 为本次前向计算选择推测 MoE 后端。
                     speculative_moe_backend_context(),
+                    # 为本次前向计算选择推测 MoE all-to-all 后端。
                     speculative_moe_a2a_backend_context(),
+                    # 将本段计算归入 draft-extend 性能分析阶段。
                     spec_stage_span("draft_extend"),
                 ):
+                    # 根据目标模型接受的 token 更新 draft 状态。
                     self.draft_worker._draft_extend_for_decode(batch, batch_output)
 
+            # 返回目标模型结果以及为下一轮准备好的状态。
             return batch_output
 
     def _build_trivial_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:

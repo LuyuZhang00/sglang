@@ -2481,88 +2481,141 @@ class DeepseekV2DecoderLayer(nn.Module):
         captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
         next_full_attention_layer_id: Optional[int] = None,
     ) -> torch.Tensor:
+        # 保存进入本层前的隐藏状态，供 MoE 输出缓冲区复用。
         hidden_states_orig = hidden_states
+        # 执行输入层通信、归一化，并按需捕获本层的辅助隐藏状态。
         hidden_states, residual = (
             self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                # 传入当前层的隐藏状态。
                 hidden_states,
+                # 传入当前层的残差分支。
                 residual,
+                # 根据当前 batch 的模式决定通信和归一化方式。
                 forward_batch,
+                # 将需要捕获的中间隐藏状态写入累加器。
                 captured_last_layer_outputs=captured_last_layer_outputs,
+                # 根据硬件和权重配置选择 GFX95 量化格式。
                 quant_format=self._resolve_gfx95_quant_format(),
             )
         )
 
+        # 在需要时临时切换到 decode attention 的张量并行上下文。
         with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+            # 执行当前层的自注意力计算。
             hidden_states = self.self_attn(
+                # 提供当前 token 的位置编码位置。
                 positions=positions,
+                # 提供注意力模块的输入隐藏状态。
                 hidden_states=hidden_states,
+                # 提供 batch 元数据和 KV cache 信息。
                 forward_batch=forward_batch,
+                # 提供用于临时张量分配的 allocator。
                 zero_allocator=zero_allocator,
+                # 传递可选的 Llama 4 缩放参数。
                 llama_4_scaling=llama_4_scaling,
+                # 传递层间 token 分散或聚合模式。
                 layer_scatter_modes=self.layer_scatter_modes,
+                # 传递上一层的 DSA top-k 索引。
                 prev_topk_indices=prev_topk_indices,
             )
+        # DSA 注意力可能同时返回注意力输出和当前层 top-k 索引。
         if isinstance(hidden_states, tuple):
+            # 拆出注意力输出和供后续层复用的索引。
             hidden_states, topk_indices = hidden_states
         else:
+            # 普通注意力没有需要向后传递的 top-k 索引。
             topk_indices = None
+        # 清理本次注意力计算暂存在张量并行上下文中的输入。
         get_attn_tp_context().clear_attn_inputs()
 
+        # 预取下一层完整注意力所需的 KV cache，隐藏数据搬运延迟。
         maybe_prefetch_next_full_attention_kv(
+            # 使用当前 batch 的执行信息决定是否预取。
             forward_batch, next_full_attention_layer_id
         )
 
+        # 准备 MLP 输入，并更新对应的残差分支。
         hidden_states, residual = self.layer_communicator.prepare_mlp(
+            # 将注意力输出作为 MLP 的输入。
             hidden_states, residual, forward_batch
         )
 
+        # 判断是否将当前 MLP 的 all-reduce 与下一层计算融合。
         fuse_mlp_allreduce = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                # 根据当前 batch 和通信布局做融合决策。
                 forward_batch
             )
         )
 
         # For DP with padding, reduce scatter can be used instead of all-reduce.
+        # 在 DP padding 场景下，判断是否使用 reduce-scatter 替代 all-reduce。
         mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            # 传入当前 batch 以获取对应的通信策略。
             forward_batch
         )
 
+        # Dense MLP 不需要使用 MoE GEMM 输出的零值分配器。
         if isinstance(self.mlp, DeepseekV2MLP):
+            # 禁用该分配器，避免为普通 MLP 预留无用空间。
             gemm_output_zero_allocator = None
 
+        # 为非原地 MoE 输出创建共享缓冲区上下文，供后续计算复用。
         if (
+            # 仅在当前层是 MoE 时启用该上下文。
             isinstance(self.mlp, DeepseekV2MoE)
+            # 非原地 MoE 需要保留输入，不能直接覆盖原 tensor。
             and not self.mlp.experts.moe_runner_config.inplace
+            # 编译期间不使用该 Python 层面的缓冲区上下文。
             and not torch.compiler.is_compiling()
         ):
+            # 延迟导入 MoE 输出缓冲区上下文，避免不必要的模块加载。
             from sglang.srt.layers.moe.moe_runner.base import moe_output_buffer_ctx
 
+            # 使用原始隐藏状态作为 MoE 输出缓冲区的依据。
             _mlp_ctx = moe_output_buffer_ctx(hidden_states_orig)
         else:
+            # 不满足条件时使用空上下文，保持统一的 with 调用结构。
             _mlp_ctx = nullcontext()
 
+        # 将 MLP 通信融合配置发布到当前前向上下文。
         with get_forward().scoped(
+            # 发布 MLP all-reduce 融合开关。
             fuse_mlp_allreduce=fuse_mlp_allreduce,
+            # 发布 MLP reduce-scatter 开关。
             mlp_reduce_scatter=mlp_reduce_scatter,
         ):
+            # 在需要时启用 MoE 输出缓冲区。
             with _mlp_ctx:
+                # 执行 Dense MLP 或 MoE 的前向计算。
                 hidden_states = self.mlp(
+                    # 提供 MLP 输入隐藏状态。
                     hidden_states,
+                    # 提供 batch 和注意力/通信相关元数据。
                     forward_batch,
+                    # 提供可选的 GEMM 输出零值分配器。
                     gemm_output_zero_allocator,
                 )
 
+        # 非 CP 场景下，标记输出以便后续层融合 MLP all-reduce。
         if (
+            # CP 场景有自己的通信流程，不能设置该融合标记。
             not (self.dsa_enable_prefill_cp or self.mla_enable_prefill_cp)
+            # 只有启用 MLP all-reduce 融合时才需要设置标记。
             and fuse_mlp_allreduce
         ):
+            # 让后续融合算子知道该 tensor 需要执行 all-reduce 融合。
             hidden_states._sglang_needs_allreduce_fusion = True
 
+        # 未进行融合时，在当前层显式完成通信后处理和残差合并。
         if not fuse_mlp_allreduce:
+            # 恢复标准的层输出和残差状态。
             hidden_states, residual = self.layer_communicator.postprocess_layer(
+                # 传入 MLP 输出隐藏状态。
                 hidden_states, residual, forward_batch
             )
 
+        # 返回当前层输出、残差以及可选的 DSA top-k 索引。
         return hidden_states, residual, topk_indices
 
     def op_comm_prepare_attn(

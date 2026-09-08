@@ -1,5 +1,32 @@
 from __future__ import annotations
 
+"""DeepSeek Sparse Attention（DSA，原 Native Sparse Attention / NSA）后端。
+
+把 Indexer 选出的 Top-K KV 槽接到 MLA kernel 上。没有本文件，DeepSeek-V3.2
+一类模型只能做 dense MLA，长上下文会把 HBM 打满。
+
+本文件不是 Scheduler，也没有 ``run_scheduler_process``。CPU 侧 continuous
+batching 在 ``managers.scheduler``；这里只服务 ModelRunner 的 GPU 前向。
+
+数据流::
+
+    Scheduler 选出 ScheduleBatch
+            │
+            ▼
+    ModelRunner.forward
+            │
+            ├─ 每拍一次: init_forward_metadata(forward_batch)
+            │       填 page_table / cu_seqlens / topk 变换元数据 → DSAMetadata
+            │
+            └─ 每一层:
+                    Indexer.forward  →  topk_indices
+                    forward_extend / forward_decode(q, k, topk_indices, ...)
+                        → 只对 topk 槽做 MLA（FlashMLA / TileLang / TRT-LLM / FA3 / aiter）
+
+两段必须拆开：Indexer 的 MQA logits 和 MLA kernel 的 page table 都按层共享
+同一份 ``DSAMetadata``，plan 不能摊到每一层。
+"""
+
 import logging
 from dataclasses import dataclass
 from typing import (
@@ -22,6 +49,7 @@ from sglang.srt.runtime_context import (
 )
 
 logger = logging.getLogger(__name__)
+
 from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
     concat_cast_kv_fp8_pad,
     dequantize_k_cache_paged,
@@ -191,6 +219,13 @@ class DSAFlashMLAMetadata:
 
 @dataclass(frozen=True)
 class DSAMetadata:
+    """一拍前向里所有层共享的 DSA plan 快照。
+
+    ``init_forward_metadata`` 写一次，``forward_extend`` / ``forward_decode``
+    和 Indexer 只读。``page_table_1`` 是 token 粒度（page_size=1）的逻辑表；
+    ``real_page_table`` 才是 KV pool 的物理块表。稀疏路径还把 seq_lens clip
+    到 ``index_topk``，得到 ``dsa_cache_seqlens_int32``。
+    """
     page_size: int
 
     # Sequence lengths for the forward batch
@@ -289,6 +324,22 @@ _DSA_IMPL_T: TypeAlias = Literal[
 class DeepseekSparseAttnBackend(
     DeepseekSparseAttnBackendMTPPrecomputeMixin, AttentionBackend
 ):
+    """DSA / 原 NSA 的 ``AttentionBackend``：稀疏 MLA 的 plan + kernel 分发。
+
+    存在的理由：FlashInfer / FA3 等 dense backend 不知道 Indexer 的 Top-K
+    下标，也无法在 paged MLA 上做 ``index_topk`` 级的 gather。本类把
+    ``req_to_token`` 编成 FlashMLA 风格的 page table，再按
+    ``dsa_prefill_backend`` / ``dsa_decode_backend`` 把一层前向派到
+    TileLang、FlashMLA sparse、TRT-LLM、FA3 或 aiter。
+
+    生命周期::
+
+        __init__                         # 加载时：选 kernel、分配 workspace
+        init_cuda_graph_state            # 可选：为 Graph 预分配宽 page table
+        每拍 init_forward_metadata       # eager plan → DSAMetadata
+          或 init_forward_metadata_out_graph
+        每层 forward_extend / forward_decode
+    """
 
     # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
     # can never carry more seqs than the pool.
@@ -307,6 +358,31 @@ class DeepseekSparseAttnBackend(
         speculative_num_steps=0,
         seed_dsa_topk_from_draft_extend: bool = False,
     ):
+        """Initialization：为本 rank 接线稀疏 MLA，不进入层循环。
+
+        只在模型加载时调用。这里决定 prefill/decode 用哪套 kernel、
+        ``index_topk`` 是多少、要不要 fused top-k，以及 FlashInfer/TRT-LLM
+        workspace。每一拍真正填 page table 的是 ``init_forward_metadata``。
+
+        参数含义
+        --------
+        model_runner:
+            持有 KV pool、req_to_token、head 配置、page_size 的运行时对象。
+            本 backend 只支持 ``is_deepseek_dsa`` 的模型。
+        skip_prefill:
+            预留给只跑 decode 的子 backend；主路径默认 False。
+        speculative_step_id:
+            EAGLE 多步 draft 中的第几步（0-based）。单步 serving 为 0。
+        topk:
+            投机树宽（EAGLE topk），不是 DSA 的 ``index_topk``。后者来自
+            HF config 的 ``index_topk`` / ``indexer_topk``。
+        speculative_num_steps:
+            draft 步数。与 ``DeepseekSparseAttnMultiStepBackend`` 配合，
+            每步一个 ``DeepseekSparseAttnBackend`` 实例。
+        seed_dsa_topk_from_draft_extend:
+            PD-disagg 下 IndexShare 用 draft-extend 的 topk 当 decode 种子。
+            为 True 时通常关掉 fused top-k，避免布局与远端不一致。
+        """
         super().__init__()
         self.forward_metadata: DSAMetadata
         self.device = model_runner.device
@@ -760,6 +836,12 @@ class DeepseekSparseAttnBackend(
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        """CUDA Graph 路径：在 capture/replay *之外* 把本拍 seq_lens 灌进静态 metadata。
+
+        与 eager ``init_forward_metadata`` 同一职责，但写的是捕获时钉死地址
+        的宽 page table，不能在 graph 内 ``torch.empty``。``in_capture=True``
+        时用 ``seq_lens.cpu()`` 做一次 D2H；replay 用已有的 ``seq_lens_cpu``。
+        """
         seq_lens_cpu = (
             forward_batch.seq_lens.cpu() if in_capture else forward_batch.seq_lens_cpu
         )
@@ -775,7 +857,30 @@ class DeepseekSparseAttnBackend(
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        """Init the metadata for a forward pass."""
+        """Init the metadata for a forward pass.
+
+        中文：Eager 路径，每一拍、进层循环之前构造 ``DSAMetadata``。
+
+        这是 DSA 与 dense backend 最大的差别所在。除了 FlashAttention 风格
+        的 ``cu_seqlens`` / ``page_table``，还要：
+        * 按 decode / verify / draft-extend / extend 展开 ``seqlens``
+          （prefill 每个新 token 对应一个递增的 KV 长度）；
+        * 决定本拍走 paged 还是 ragged 的 topk 变换；
+        * Prefill CP 时按 rank 切序列，避免各 CP rank 扫全量 KV；
+        * 把 page_size>1 的物理表收成 page_size=1 的 ``page_table_1``，
+          供 Indexer 和稀疏 MLA 共用。
+
+        结果写入 ``self.forward_metadata``，本拍所有层 + Indexer 只读它。
+
+        参数
+        ----
+        forward_batch:
+            * ``forward_mode`` — decode / extend / target_verify / draft_extend；
+            * ``req_pool_indices`` / ``seq_lens`` — 定位 req_to_token 行；
+            * ``extend_seq_lens`` / ``extend_prefix_lens`` — prefill 新 token
+              与已缓存前缀；
+            * ``spec_info`` — 投机解码的 draft token 数与自带 indices。
+        """
         batch_size = forward_batch.batch_size
         device = forward_batch.seq_lens.device
 
@@ -1887,6 +1992,25 @@ class DeepseekSparseAttnBackend(
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """一层 transformer 的稀疏 prefill / extend / verify MLA。
+
+        调用时机：``init_forward_metadata`` 已 plan、Indexer 已给出
+        ``topk_indices``。本函数把本拍 K 写入 MLA KV cache，再按
+        ``dsa_prefill_impl``（verify/draft-extend 改用 decode impl）把
+        Q 只 attend 到 Top-K 槽。
+
+        参数含义
+        --------
+        q: absorbed MLA 的 nope 部分，或已经拼好的 q_all。
+        k / v: 本拍新 token 的 compressed KV；v 在 MLA 里常与 k 同源。
+        layer: 当前 ``RadixAttention``（head 数、v_head_dim）。
+        forward_batch: 与 plan 同一拍；主要用 ``out_cache_loc`` 写 cache。
+        save_kv_cache: False 时只算 attention 不写 cache。
+        q_rope / k_rope: RoPE 子空间；MLA 把 nope+rope 拼成 576-d 再进 kernel。
+        topk_indices: Indexer 输出，``[num_tokens, index_topk]``，-1 为 pad。
+        cos_sin_cache / is_neox / llama_4_scaling: 个别 kernel（TRT-LLM）
+            在 attention 内做 RoPE 时需要。
+        """
 
         causal = not layer.is_cross_attention
         metadata = self.forward_metadata
@@ -1965,6 +2089,7 @@ class DeepseekSparseAttnBackend(
             q_rope = q_all[:, :, layer.v_head_dim :]
 
         # NOTE(dark): here, we use page size = 1
+        # Indexer / 稀疏 MLA 按 token 寻址；物理 page_size>1 已在 plan 时展开成 page_table_1。
         topk_transform_method = self.get_topk_transform_method(
             forward_batch.forward_mode
         )
@@ -2197,6 +2322,13 @@ class DeepseekSparseAttnBackend(
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """一层 transformer 的稀疏 decode MLA（每序列通常 1 个 query）。
+
+        与 ``forward_extend`` 的差别：query 极短，历史 K 已在 paged MLA
+        cache 里；``topk_indices`` 从 Indexer 的 paged MQA logits 来，
+        kernel 只读 ``index_topk`` 个槽而不是 ``seq_len``。先写本拍 K
+        再 attend。参数含义与 ``forward_extend`` 相同。
+        """
 
         causal = not layer.is_cross_attention
         metadata = self.forward_metadata
@@ -3425,6 +3557,12 @@ class DeepseekSparseAttnBackend(
 
 
 class DeepseekSparseAttnMultiStepBackend:
+    """EAGLE 多步 draft 把若干次 DSA decode 叠进一次 forward。
+
+    每一步的 page table / topk 布局不同，所以为 ``speculative_num_steps-1``
+    个 step 各建一个 ``DeepseekSparseAttnBackend``。没有独立的
+    ``run_scheduler_process``：仍由 Scheduler 拉起的那个 GPU 进程调用。
+    """
 
     # Per-step draft decode replays from precomputed GPU metadata; opt out so
     # decide_needs_cpu_seq_lens' OR over the backends stays False.
@@ -3452,6 +3590,7 @@ class DeepseekSparseAttnMultiStepBackend:
             )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        """把同一拍 metadata 下发到每一个 draft step 的 DSA backend。"""
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_forward_metadata(forward_batch)
 

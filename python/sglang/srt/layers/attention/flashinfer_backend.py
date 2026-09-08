@@ -10,6 +10,67 @@ Support different attention backends.
 Now there are two backends: FlashInfer and Triton.
 FlashInfer is faster and Triton is easier to customize.
 Each backend supports two operators: extend (i.e. prefill with cached prefix) and decode.
+
+----------------------------------------------------------------------
+中文说明：本文件为什么存在、它在 serving 热路径里做什么
+----------------------------------------------------------------------
+
+SGLang 的 attention 通过 ``AttentionBackend`` 抽象：每一层 ``RadixAttention``
+只调用 ``forward_extend`` / ``forward_decode``，不绑定具体 kernel。本文件是
+默认的 CUDA 高性能实现，把 FlashInfer 的 *paged* / *ragged* wrapper 接到
+SGLang 的 page table（``req_to_token`` + ``token_to_kv_pool``）上。
+
+没有这层适配，FlashInfer 不知道：
+* 每个请求的 KV 散落在哪些 page（continuous batching / radix cache）；
+* 本拍是 decode（每序列 1 个 query）还是 extend（prefill，可能带 cached prefix）；
+* sliding-window / cross-attn 要不要拆成两套 wrapper；
+* CUDA Graph replay 时如何避免每层都做一次昂贵的 ``plan()``。
+
+因此本 backend 把工作拆成两段，而不是每层直接调 kernel：
+
+1. **Initialization（``__init__``）**：分配 workspace、indptr 缓冲，构造
+   FlashInfer wrapper 和 indices updater。只在模型加载时跑一次。
+2. **``init_forward_metadata``（eager）/ ``init_forward_metadata_out_graph``
+   （CUDA Graph）**：每一拍、在进入 transformer 层循环 *之前* 根据本批
+   page table 调用 wrapper.``begin_forward`` / ``plan()``。同一拍所有层
+   共享这份 plan。
+3. **``forward_extend`` / ``forward_decode``**：每一层只把 Q/K/V 和 KV
+   cache 交给已经 plan 好的 wrapper.``forward``。
+
+进程内数据流::
+
+    Scheduler 选出 ScheduleBatch
+            │
+            ▼
+    ModelRunner.forward
+            │
+            ├─ attn_backend.init_forward_metadata(forward_batch)   # 每拍一次
+            │       │
+            │       ├─ decode: IndicesUpdaterDecode.update
+            │       │           → BatchDecodeWithPagedKVCacheWrapper.begin_forward
+            │       └─ extend: IndicesUpdaterPrefill.update
+            │                   → ragged / paged PrefillWrapper.begin_forward
+            │
+            └─ for layer in transformer:
+                    RadixAttention
+                        ├─ extend → FlashInferAttnBackend.forward_extend
+                        └─ decode → FlashInferAttnBackend.forward_decode
+                              └─ wrapper.forward(q, paged_kv)
+
+两种 extend kernel 的分工::
+
+    新 token（本拍要算的 Q）          已缓存 prefix（radix / chunked）
+            │                                    │
+            ▼                                    ▼
+    ragged wrapper（连续 K/V 张量）     paged wrapper（page table）
+            │                                    │
+            └──────── merge_state (LSE) ─────────┘
+                              │
+                              ▼
+                         最终 attention 输出
+
+``use_ragged=False`` 时整段都走 paged（多模态、MIS、确定性推理、强制 paged）。
+decode 永远走 paged：每序列只有 1 个 query，K/V 已全部在 cache 里。
 """
 
 import logging
@@ -112,6 +173,12 @@ if is_flashinfer_available():
 
 
 class WrapperDispatch(Enum):
+    """选择第 0 套还是第 1 套 FlashInfer wrapper。
+
+    混合模型（sliding-window + full attention，或 encoder-decoder）一层里
+    会有两种 KV 布局，FlashInfer 的 ``plan()`` 把 window_left / page table
+    固化进 wrapper，所以必须准备两套，按层类型分发。普通 GQA 只有一套。
+    """
     SLIDING_WINDOW = auto()
     CROSS_ATTENTION = auto()
 
@@ -122,6 +189,10 @@ class MultiItemScoringParams:
 
     Used when processing sequences with multiple items separated by delimiters,
     where each item needs specific attention patterns that respect item boundaries.
+
+    中文：多选项打分（例如「问题 + 若干候选项」）时，用 delimiter 切开
+    每个 item 的注意力范围，避免候选项之间互相 attend。这些张量在
+    ``init_forward_metadata`` 里算好，plan 时喂给 FlashInfer paged wrapper。
 
     Attributes:
         prefix_len_ptr: A uint32 1D tensor indicating the prefix length of each prompt.
@@ -148,6 +219,11 @@ class MultiItemScoringParams:
 
 @dataclass
 class DecodeMetadata:
+    """decode 路径在 ``init_forward_metadata`` 里写好、各层 ``forward_decode`` 读的快照。
+
+    decode_wrappers: 已经 ``begin_forward`` 过的 paged-decode wrapper 列表。
+    swa_out_cache_loc: sliding-window KV pool 的写地址；full attention 层忽略。
+    """
     decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper]
     # full->SWA translated out_cache_loc (SWA KV-store write target)
     swa_out_cache_loc: Optional[torch.Tensor] = None
@@ -155,6 +231,14 @@ class DecodeMetadata:
 
 @dataclass
 class PrefillMetadata:
+    """extend / verify 路径的 plan 快照，各层 ``forward_extend`` 只读这些字段。
+
+    prefill_wrappers: 已 plan 的 paged-prefill wrapper。
+    use_ragged: True 时新 token 走 ragged、prefix 走 paged，再 merge_state。
+    extend_no_prefix: 没有任何 radix/chunked 前缀，可跳过 paged 半边。
+    multi_item_params: multi-item scoring 的 delimiter 注意力参数。
+    swa_out_cache_loc: 同 DecodeMetadata，SWA 层的 KV 写目标。
+    """
     prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper]
     use_ragged: bool
     extend_no_prefix: bool
@@ -290,7 +374,29 @@ def fast_prefill_plan(
 
 
 class FlashInferAttnBackend(AttentionBackend):
-    """Flashinfer attention kernels."""
+    """Flashinfer attention kernels.
+
+    中文：把 FlashInfer 接到 SGLang 的 paged KV 与 continuous batching 上。
+
+    存在的理由：FlashInfer 提供高性能的 paged-decode / paged-prefill /
+    ragged-prefill kernel，但要求调用方先 ``plan()`` 再 ``forward()``。
+    SGLang 的 KV 是按 page 散列的，batch 形状每拍都变，所以必须有一个
+    backend 在「层循环之外」根据 ``req_to_token`` 填 indptr/indices，
+    再让每一层只跑 kernel。这就是本类。
+
+    生命周期::
+
+        __init__                    # 模型加载：workspace + wrappers
+            │
+        init_cuda_graph_state       # 可选：为 CUDA Graph 预分配 indices
+            │
+        每拍 ModelRunner.forward:
+            init_forward_metadata   # eager：plan 当前 batch
+              或 init_forward_metadata_out_graph  # graph replay
+            │
+            for layer:
+                forward_extend / forward_decode   # 只跑 kernel
+    """
 
     # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
     # can never carry more seqs than the pool.
@@ -304,6 +410,38 @@ class FlashInferAttnBackend(AttentionBackend):
         kv_last_page_len_buf: Optional[torch.Tensor] = None,
         init_new_workspace: bool = False,
     ):
+        """Initialization：为本 rank 的 ModelRunner 接线 FlashInfer。
+
+        只在模型加载 / attention backend 切换时调用一次，不在热路径上。
+        这里分配的是 *跨 iteration 复用* 的资源：workspace、indptr 缓冲、
+        wrapper 对象。每一拍真正填入 page table 的是
+        ``init_forward_metadata``，不是这里。
+
+        为什么要预创建多套 wrapper
+        --------------------------
+        FlashInfer 的 ``plan()`` 会把 batch 布局写进 wrapper 内部 buffer。
+        CUDA Graph 捕获后这些 buffer 地址不能换，所以 decode / verify /
+        draft-extend / 普通 prefill 各有一套（或按 bs 再克隆）。eager 路径
+        用 ``self.decode_wrappers`` / ``self.prefill_wrappers_paged``；
+        graph 路径用 ``*_cuda_graph_metadata[bs]``。
+
+        参数含义
+        --------
+        model_runner:
+            持有 ``req_to_token_pool``、``token_to_kv_pool``、head 数、
+            page_size、dtype 的运行时对象。backend 只读这些，不反向持有
+            Scheduler。
+        skip_prefill:
+            True 时不建 prefill/verify wrapper。EAGLE 多步 draft 的中间
+            步只有 decode，用这个开关省 workspace 和 plan 开销。
+        kv_indptr_buf / kv_last_page_len_buf:
+            外部传入的 indptr / last_page_len。多步 draft 让各 step 共享
+            同一块 last_page_len、各自一块 indptr，避免每步再 alloc。
+            普通路径传 ``None``，本函数自己按 CUDA Graph max_bs 分配。
+        init_new_workspace:
+            True 时不用全局共享 workspace，单独 alloc 一块。多个 backend
+            实例并发 plan 时（例如 hybrid）避免互相踩 workspace。
+        """
         super().__init__()
         self.prefill_backend = "fa2"
         self.decode_backend = "fa2"
@@ -363,6 +501,7 @@ class FlashInferAttnBackend(AttentionBackend):
         )
 
         # Parse constants
+        # GQA 很大或 FP8 KV 时 decode 走 tensor core；否则 CUDA core 更合适。
         self.decode_use_tensor_cores = should_use_tensor_core(
             kv_cache_dtype=self.flashinfer_kv_cache_dtype,
             num_attention_heads=model_runner.model_config.num_attention_heads
@@ -381,9 +520,11 @@ class FlashInferAttnBackend(AttentionBackend):
         ), "Sliding window and cross attention are not supported together"
 
         if model_runner.sliding_window_size is not None:
+            # 混合 SWA：两套 wrapper，第 0 套窗口注意力，第 1 套 full。
             self.num_wrappers = 2
             self.dispatch_reason = WrapperDispatch.SLIDING_WINDOW
         elif model_runner.model_config.is_encoder_decoder:
+            # encoder-decoder：第 0 套 decoder self-attn，第 1 套 cross-attn。
             self.num_wrappers = 2
             self.dispatch_reason = WrapperDispatch.CROSS_ATTENTION
         else:
@@ -426,6 +567,8 @@ class FlashInferAttnBackend(AttentionBackend):
 
         # Allocate buffers
         # different from flashinfer zero_init_global_workspace_buffer
+        # workspace 是 FlashInfer plan/split-kv 的暂存区，默认全 backend 共享一块，
+        # 避免每个 wrapper 再占几百 MB。
         global_workspace_buffer = get_buffer(
             "flashinfer_workspace",
             lambda: torch.empty(
@@ -484,6 +627,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
         # Two wrappers: one for sliding window attention and one for full attention.
         # Using two wrappers is unnecessary in the current PR, but are prepared for future PRs
+        # 中文：num_wrappers=2 时 [0]=SWA 或 decoder self-attn，[1]=full 或 cross-attn。
         self.prefill_wrappers_paged = []
         self.prefill_wrappers_verify = []
         self.decode_wrappers = []
@@ -513,6 +657,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
 
         # Create indices updater
+        # updater 负责把 req_to_token 展开成 FlashInfer 的 kv_indptr / kv_indices。
         if not skip_prefill:
             self.indices_updater_prefill = FlashInferIndicesUpdaterPrefill(
                 model_runner, self
@@ -700,15 +845,41 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        """CUDA Graph 路径：在 ``graph.capture()`` / ``replay()`` *之外* 刷新 plan。
+
+        与 eager 的 ``init_forward_metadata`` 做同一件事（根据本拍 page table
+        调用 wrapper.``begin_forward``），但目标 wrapper 是捕获时钉死地址的
+        那一套（``decode_cuda_graph_metadata[bs]`` 等），并且禁止在 graph
+        内做动态 shape alloc。
+
+        ``in_capture=True`` 时还会：
+        * 按 bs 创建 graph wrapper（``_prepare_cuda_graph_metadata``）；
+        * 把 decode / draft-extend 的 ``begin_forward`` 换成
+          ``fast_decode_plan`` / ``fast_prefill_plan``，去掉 replay 时的 D2H。
+
+        参数
+        ----
+        forward_batch: 本拍的 token、seq_lens、req_pool_indices、forward_mode。
+        in_capture: True=正在捕获图；False=eager 默认包装或 graph replay。
+        """
+        # 图捕获按「最大 bs」钉死 wrapper buffer；切片时只用本拍真实 batch 大小。
         bs = forward_batch.batch_size
+        # 每个序列在 req_to_token 里的行号，用来展开 kv_indices。
         req_pool_indices = forward_batch.req_pool_indices
+        # GPU 上的 KV 长度；plan 里 cumsum 成 kv_indptr。
         seq_lens = forward_batch.seq_lens
+        # Host 镜像，用来在 CPU 上算 indptr，避免 plan() 内部 D2H。
         seq_lens_cpu = forward_batch.seq_lens_cpu
+        # 本批 KV token 总数，决定 kv_indices 分配/切片长度。
         seq_lens_sum = forward_batch.seq_lens_sum
+        # encoder-decoder 才有；普通因果模型为 None。
         encoder_lens = forward_batch.encoder_lens
+        # 决定走 decode / verify / draft-extend / 普通 extend 哪条 plan 分支。
         forward_mode = forward_batch.forward_mode
+        # 投机解码自带的 kv_indptr / mask；没有投机时为 None。
         spec_info = forward_batch.spec_info
 
+        # ragged verify 的 Q/K 是连续张量，CUDA Graph 要求 paged + 固定 buffer，对不上。
         if (
             spec_info is not None
             and spec_info.ragged_verify_layout is not None
@@ -719,53 +890,74 @@ class FlashInferAttnBackend(AttentionBackend):
                 "disable SGLANG_RAGGED_VERIFY_MODE for this configuration."
             )
 
+        # 只在「第一次捕获」时按 bs 创建/取出钉死地址的 graph wrapper。
+        # replay 时这些 wrapper 已存在，不能再 alloc，否则图里的指针失效。
         if in_capture:
+            # positions.numel() 是本图的 token 上限（decode 常等于 bs，verify 会更大）。
             num_tokens = forward_batch.positions.numel()
+            # 按 mode 把 wrapper 放进 decode/verify/draft-extend/full-prefill 字典。
             self._prepare_cuda_graph_metadata(bs, num_tokens, forward_mode, spec_info)
 
+        # ---------- 按 forward_mode 调用对应 updater.plan / begin_forward ----------
         if forward_mode.is_decode_or_idle():
+            # 每序列 1 个 query：填 paged-decode wrapper 的 indptr/indices。
             self.indices_updater_decode.update(
+                # 图 buffer 可能按 max_bs 分配，只取本拍前 bs 个有效序列。
                 req_pool_indices[:bs],
                 seq_lens[:bs],
+                # 没有 host 镜像时让 plan 走 GPU cumsum（会多一次潜在同步）。
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
+                # 必须用捕获时那套 wrapper，不能用 eager 的 self.decode_wrappers。
                 decode_wrappers=self.decode_cuda_graph_metadata[bs],
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
+                # Graph replay 不按确定性推理改 split tile；split 策略在捕获时冻结。
                 fixed_split_size=None,
+                # 确定性推理会关掉 CUDA Graph 的 kv split，避免 tile 数随序列变化。
                 disable_split_kv=self.disable_cuda_graph_kv_split,
             )
         elif forward_mode.is_target_verify():
+            # 多个 draft token 当一段 prefill 跑，带投机 custom mask。
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
+                # verify 的 Q 覆盖整段 draft，没有「只 attend prefix」的 ragged 半边。
                 prefix_lens=None,
+                # verify 专用 graph wrapper，与普通 prefill 隔离，避免 mask/bs 冲突。
                 prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
+                # Graph 只支持 paged：ragged 要动态长度的连续 K/V，无法钉进图。
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
+                # mask / kv_indices 由 spec_info 提供，updater 不再从 req_to_token 展开。
                 spec_info=spec_info,
             )
         elif forward_mode.is_dllm_extend():
+            # 扩散 LLM 每次 extend 固定 block_size 个 token，前缀 = 全长 - block。
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
+                # paged 半边只看已经生成的 token，新 block 走 ragged（若未强制 paged）。
                 prefix_lens=seq_lens - self.dllm_config.block_size,
                 prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
+                # SGLANG_FLASHINFER_USE_PAGED 打开时整段走 paged。
                 use_ragged=not self.use_paged,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=None,
             )
         elif forward_mode.is_draft_extend_v2():
+            # EAGLE V2：draft worker 把推测 token 当 prefill extend 写入 KV。
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
                 prefix_lens=None,
+                # 与 verify/decode 分开存，因为 qo_indptr 形状不同。
                 prefill_wrappers=self.draft_extend_cuda_graph_metadata[bs],
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
@@ -778,24 +970,33 @@ class FlashInferAttnBackend(AttentionBackend):
             # target-verify / draft-extend / dllm branches (also is_extend()).
             # Split-kv must stay on — its block_valid_mask is the only
             # early-exit for the captured fixed grid's padded/stale tiles.
+            # 中文：普通 prefill 的 FullCG。is_extend() 也会匹配 verify/dllm/draft，
+            # 所以本分支必须放在那些 elif 之后。split-kv 保持开启，靠
+            # block_valid_mask 跳过图里多出来的 padding tile。
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
+                # 已缓存前缀长度；paged wrapper 只 attend 这段，新 token 会先写入 cache。
                 prefix_lens=forward_batch.extend_prefix_lens[:bs],
+                # 所有 token-bucket 共用一套 wrapper（FullCG 固定 bs=1）。
                 prefill_wrappers=self.full_cg_prefill_wrappers,
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=None,
             )
         else:
+            # 走到这里说明 CUDA Graph 捕获了一个 FlashInfer 不支持的 mode。
             raise ValueError("Invalid forward mode")
 
+        # 捕获刚跑完一次真正的 plan()，wrapper._cached_module 已就绪，
+        # 此后 replay 换成 fast_decode_plan，跳过每次 D2H。
         if in_capture and forward_mode.is_decode_or_idle():
             # fast_decode_plan needs _cached_module from the initial begin_forward
             # above, so install it only after that first plan has run.
             for w in self.decode_cuda_graph_metadata[bs]:
+                # partial 把 wrapper 绑成 self，替换掉上游的 begin_forward。
                 w.begin_forward = partial(fast_decode_plan, w)
 
         if (
@@ -804,6 +1005,7 @@ class FlashInferAttnBackend(AttentionBackend):
             and self.prefill_backend == "fa2"
             # Host-rebuilt layout only matches full attention (single wrapper);
             # SWA/cross-attn keep the plain plan().
+            # 中文：fast_prefill_plan 只实现了 fa2 + 单 wrapper 的 host indptr 路径。
             and self.dispatch_reason is None
         ):
             # Like decode: swap in fast_prefill_plan for replay, after the real
@@ -814,16 +1016,22 @@ class FlashInferAttnBackend(AttentionBackend):
 
         # Refill the SWA write-target buffer from the live out_cache_loc before
         # replay (bound onto the metadata at capture below).
+        # 中文：SWA 层写入另一套 KV pool，地址必须从 full loc 翻译成 SWA loc。
+        # 图里不能每次 alloc，所以拷进预分配的 cuda_graph_swa_out_cache_loc。
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
             assert self._swa_kv_pool is not None
+            # 本拍实际要写的新 token 数（可能小于 buffer 容量）。
             n = forward_batch.out_cache_loc.shape[0]
+            # 尾部清零，避免 replay 时读到上一拍残留的 SWA 写地址。
             self.cuda_graph_swa_out_cache_loc[n:].zero_()
+            # 前 n 个槽换成「full page → SWA page」映射后的写目标。
             self.cuda_graph_swa_out_cache_loc[:n].copy_(
                 self._swa_kv_pool.translate_loc_from_full_to_swa(
                     forward_batch.out_cache_loc
                 )
             )
             if in_capture:
+                # 捕获时把这段 view 绑到 metadata 上，图内 set_kv_buffer 读的是固定指针。
                 self.forward_metadata.swa_out_cache_loc = (
                     self.cuda_graph_swa_out_cache_loc[:n]
                 )
@@ -909,6 +1117,38 @@ class FlashInferAttnBackend(AttentionBackend):
         return layer.k_scale, layer.v_scale
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        """Eager 路径：每一拍、进层循环之前，为当前 batch 做 FlashInfer ``plan()``。
+
+        这是本 backend 最关键的分界。``plan()`` 要根据 page table 算 split-kv
+        tile、写 wrapper 内部 buffer，开销按层摊会重复几十次；所以 ModelRunner
+        只调用一次，随后每层 ``forward_*`` 复用 ``self.forward_metadata``。
+
+        按 ``forward_mode`` 分支::
+
+            DECODE / IDLE  → IndicesUpdaterDecode + DecodeMetadata
+            TARGET_VERIFY  → paged prefill wrapper（投机校验，带 custom mask）
+            EXTEND 等      → ragged 和/或 paged prefill + PrefillMetadata
+
+        extend 何时用 ragged
+        --------------------
+        默认：确定性推理 / piecewise CUDA Graph / 强制 paged / 多模态 / MIS
+        都关掉 ragged，整段走 paged。否则有 cached prefix 时
+        ``use_ragged=True``：新 token 用连续 K/V（ragged），prefix 用
+        paged，最后 ``merge_state``。没有任何 prefix 时 ``extend_no_prefix``
+        为真，只跑 ragged，省一次 paged kernel。
+
+        参数
+        ----
+        forward_batch:
+            本拍前向描述。本函数主要读：
+            * ``forward_mode`` — decode / extend / verify / draft-extend；
+            * ``req_pool_indices`` — 每个序列在 req_to_token 里的行号；
+            * ``seq_lens`` / ``seq_lens_cpu`` / ``seq_lens_sum`` — KV 长度；
+            * ``extend_prefix_lens`` — 已缓存前缀长度（extend 才有）；
+            * ``out_cache_loc`` — 本拍新 token 写入 KV pool 的位置；
+            * ``spec_info`` — 投机解码自带的 indptr / mask；
+            * ``encoder_lens`` — encoder-decoder 的 encoder 侧长度。
+        """
         swa_out_cache_loc = None
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
             assert self._swa_kv_pool is not None
@@ -917,6 +1157,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
 
         if forward_batch.forward_mode.is_decode_or_idle():
+            # 每序列 1 个 query，plan paged-decode wrapper。
             self.indices_updater_decode.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
@@ -932,6 +1173,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 self.decode_wrappers, swa_out_cache_loc=swa_out_cache_loc
             )
         elif forward_batch.forward_mode.is_target_verify():
+            # 投机校验：多个 draft token 当 prefill 来跑，必须 paged + custom mask。
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
@@ -1010,6 +1252,11 @@ class FlashInferAttnBackend(AttentionBackend):
         max_num_tokens: int,
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
+        """为 CUDA Graph 预分配 kv_indices / custom_mask 等固定地址 buffer。
+
+        Graph 捕获后不能再 ``torch.empty`` 变长 indices，所以按
+        max_num_tokens * max_context_len 一次分配够用的上限。
+        """
         if kv_indices_buf is None:
             cuda_graph_kv_indices = torch.zeros(
                 (max_num_tokens * self.max_context_len,),
@@ -1270,6 +1517,37 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
+        """一层 transformer 的 prefill / extend attention。
+
+        调用时机：``init_forward_metadata`` 已经 plan 好之后，每一层
+        ``RadixAttention`` 进来一次。本函数不再算 page table，只选 wrapper
+        并 ``forward``。
+
+        两条路径（由 ``forward_metadata.use_ragged`` 决定）::
+
+            paged-only（use_ragged=False）
+                先把本拍 K/V 写入 KV cache，再一次性 paged-prefill
+                （Q 看 prefix + 新 token，都在 page table 里）。
+
+            ragged + paged（use_ragged=True）
+                ragged: Q 对「本拍连续 K/V」做因果 attention；
+                paged:  Q 对「已缓存 prefix」做非因果 attention；
+                merge_state 按 log-sum-exp 合成。K/V 在 kernel 之后再写入
+                cache，避免 paged 半边看到尚未对齐的新 page。
+
+        参数含义
+        --------
+        q: 本层 query，形状 ``[num_tokens, tp_q_head_num * head_dim]``。
+           extend 时 ``num_tokens`` 是本拍所有序列 *新* token 之和。
+        k / v: 本拍新 token 的 key/value，形状与 q 类似（KV head 数可能更少）。
+               可为 ``None``（从 cache 回读，例如某些 loop-coder 路径）。
+        layer: 当前 ``RadixAttention``，提供 head 数、sm_scale、sliding_window、
+               logit_cap、是否 cross-attn。
+        forward_batch: 与 ``init_forward_metadata`` 同一拍的 batch；这里主要用
+               ``out_cache_loc`` / ``encoder_out_cache_loc`` 写 KV。
+        save_kv_cache: False 时只算 attention 不写 cache（encoder-only 或
+               某些 speculative 中间步）。
+        """
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
             self._get_wrapper_idx(layer)
         ]
@@ -1306,6 +1584,7 @@ class FlashInferAttnBackend(AttentionBackend):
             kv_cache = pool.get_kv_buffer(layer.layer_id)
 
         # use paged attention
+        # 先写 cache 再 paged-prefill：新 token 的 K/V 已经在 page table 指向的位置。
         if not self.forward_metadata.use_ragged:
             if k is not None and save_kv_cache:
                 assert v is not None
@@ -1411,6 +1690,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 o, _ = _safe_merge_state(o1, s1, o2, s2)
 
             if save_kv_cache:
+                # ragged 路径在 kernel 之后才写 cache，避免 paged 半边读到半截新 page。
                 self.token_to_kv_pool.set_kv_buffer(
                     layer,
                     KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
@@ -1431,6 +1711,18 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
+        """一层 transformer 的 decode attention（每序列通常 1 个新 token）。
+
+        与 ``forward_extend`` 的差别：query 很短，全部历史 K/V 已在 paged
+        cache 里，因此只走 ``BatchDecodeWithPagedKVCacheWrapper``，没有
+        ragged 半边，也不需要 merge_state。先把本拍 K/V 写入 cache，再让
+        Q attend 整段 KV——FlashInfer decode kernel 假设新 token 已经在
+        page table 指向的位置上。
+
+        参数含义与 ``forward_extend`` 相同，但 ``q/k/v`` 的 token 维是
+        ``batch_size``（或投机 decode 的 ``batch_size * 扩展宽度``），
+        不是 prefill 的变长拼接。
+        """
         decode_wrapper = self.forward_metadata.decode_wrappers[
             self._get_wrapper_idx(layer)
         ]
@@ -1481,6 +1773,12 @@ class FlashInferAttnBackend(AttentionBackend):
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def _get_wrapper_idx(self, layer: RadixAttention):
+        """按层类型选第 0 套还是第 1 套 wrapper。
+
+        SWA：sliding_window_size==-1 的层用 full wrapper（index 1）。
+        Cross-attn：is_cross_attention 的层用 index 1。
+        单 wrapper 模型永远返回 0。
+        """
         if self.num_wrappers == 1:
             return 0
 
@@ -1493,6 +1791,14 @@ class FlashInferAttnBackend(AttentionBackend):
 
 
 class FlashInferIndicesUpdaterDecode:
+    """把本拍 decode batch 的 page table 写成 FlashInfer 的 indptr/indices 并 ``plan()``。
+
+    存在的理由：``req_to_token[req_id, :seq_len]`` 是「逻辑 token → KV page」
+    的二维表，FlashInfer 要的是 CSR 风格的 ``kv_indptr`` + 一维
+    ``kv_indices``。这个转换每拍做一次、所有 decode 层共享，所以独立成类。
+    ``self.update`` 在构造时绑定到 single / sliding_window / cross_attention
+    三个实现之一，热路径不再分支。
+    """
     def __init__(self, model_runner: ModelRunner, attn_backend: FlashInferAttnBackend):
         # Parse Constants
         # Plan with the max per-layer head count: FlashInfer bakes num_qo_heads
@@ -1538,6 +1844,17 @@ class FlashInferIndicesUpdaterDecode:
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
     ):
+        """占位签名：运行时被替换为 ``update_single_wrapper`` 等。
+
+        参数（三个实现共用）
+        --------------------
+        req_pool_indices: 本批每个序列在 req_to_token 中的行。
+        seq_lens / seq_lens_cpu / seq_lens_sum: 每个序列的 KV 长度及总和。
+        decode_wrappers: 要 plan 的 wrapper 列表（eager 或 CUDA Graph 那套）。
+        encoder_lens: encoder-decoder 时 encoder 侧长度；普通模型为 None。
+        spec_info: 投机解码若已带 kv_indptr/kv_indices 则跳过展开。
+        fixed_split_size / disable_split_kv: 确定性推理的 split-kv 旋钮。
+        """
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
 
@@ -1672,6 +1989,13 @@ class FlashInferIndicesUpdaterDecode:
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
     ):
+        """真正调用 FlashInfer decode ``plan()`` / ``fast_decode_plan``。
+
+        先用 Triton kernel 把 ``req_to_token`` 展开成 ``kv_indices``
+        （CSR 的列索引），再 ``begin_forward``。CUDA Graph 模式下 indices
+        直接写进 wrapper 预分配的 buffer，避免每拍 alloc。
+        ``seq_lens_cpu`` 用来在 host 上算 indptr，去掉 plan 内部的 D2H。
+        """
         if spec_info is None or getattr(spec_info, "kv_indptr", None) is None:
             bs = len(req_pool_indices)
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
@@ -1765,6 +2089,13 @@ class FlashInferIndicesUpdaterDecode:
 
 
 class FlashInferIndicesUpdaterPrefill:
+    """extend / verify 的 page table → FlashInfer plan。
+
+    与 decode updater 的差别：还要填 ``qo_indptr``（每个序列有多少 *新*
+    query token = seq_len - prefix_len），以及可选地同时 plan ragged
+    wrapper。ragged 模式下 paged 半边只覆盖 prefix，所以
+    ``paged_kernel_lens = prefix_lens``，而不是整段 seq_lens。
+    """
     def __init__(self, model_runner: ModelRunner, attn_backend: FlashInferAttnBackend):
         # Parse Constants
         # Plan with the max per-layer head count: FlashInfer bakes num_qo_heads
@@ -1816,6 +2147,14 @@ class FlashInferIndicesUpdaterPrefill:
         extend_prefix_lens_cpu: Optional[List[int]] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
     ):
+        """占位签名：运行时被替换为 ``update_single_wrapper`` 等。
+
+        相对 decode updater 多出来的参数：
+        prefix_lens: 已缓存前缀长度；ragged 时 paged 半边只 attend 这段。
+        use_ragged: 是否同时 plan ragged wrapper。
+        multi_item_params: delimiter 感知的注意力参数，喂给 FlashInfer。
+        custom_kv_indices: FP4 dequant workspace 的 page table，覆盖默认展开。
+        """
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
 
@@ -2076,6 +2415,13 @@ class FlashInferIndicesUpdaterPrefill:
         custom_kv_indices: Optional[torch.Tensor] = None,
         window_left: int = -1,
     ):
+        """把 qo_indptr / kv_indptr / kv_indices 填好并调用两个 wrapper 的 plan。
+
+        ``qo_indptr`` = cumsum(seq_lens - prefix_lens)，即每个序列本拍有多少
+        query token。ragged wrapper 用它切 Q；paged wrapper 用 kv_indptr
+        切 prefix KV。spec_info 存在时（verify / draft-extend）改用投机
+        解码自己生成的 mask 和 indptr。
+        """
         bs = len(seq_lens)
         if spec_info is None:
             assert prefix_lens is not None
@@ -2240,6 +2586,11 @@ class FlashInferMultiStepDraftBackend:
     """
     Wrap multiple flashinfer attention backends as one for multiple consecutive
     draft decoding steps.
+
+    中文：EAGLE 一类多步 draft 把若干次 decode 叠在一次 forward 里。
+    每一步的 page table 不同（树宽 topk、步数递增），所以不能共用一个
+    FlashInferAttnBackend 的 indptr。本类为每一步各建一个 skip_prefill
+    的 backend，共享 last_page_len，分步 plan 后再分别 ``forward_decode``。
     """
 
     def __init__(
@@ -2341,6 +2692,7 @@ class FlashInferMultiStepDraftBackend:
         global_override_indptr_cpu = None
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        """为 EAGLE 多步 draft 一次性展开所有 step 的 kv_indices 并分别 plan。"""
         kv_indices_width = draft_kv_indices_buffer_width(
             forward_batch.batch_size, self.topk, self.max_context_len
         )
@@ -2384,16 +2736,26 @@ class FlashInferMultiStepDraftBackend:
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        """EAGLE 多步 draft：把 CUDA Graph 外的 plan 下发到每一步的 FlashInfer backend。
+
+        本类自己不持有 wrapper，只是按 step 切出 inner ForwardBatch 再调用
+        ``FlashInferAttnBackend.init_forward_metadata_out_graph``。
+        """
+        # 延迟导入：避免模块顶层与 forward_batch_info 形成循环依赖。
         from sglang.srt.model_executor.forward_batch_info import build_inner_fb_view
 
+        # 外层 batch_size 是「请求数」；inner decode 视图里会再乘 topk。
         bs = forward_batch.batch_size
 
         def call_fn(i, fb):
+            # 第 i 步 draft decode 看成一次普通 DECODE，复用该 step 的 backend。
             inner_fb = build_inner_fb_view(fb, bs=bs, forward_mode=ForwardMode.DECODE)
+            # in_capture 原样下传：捕获时创建 graph wrapper，replay 时只刷新 plan。
             self.attn_backends[i].init_forward_metadata_out_graph(
                 inner_fb, in_capture=in_capture
             )
 
+        # 先生成所有 step 的 kv_indices，再逐 step 调用上面的 call_fn。
         self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
@@ -2408,6 +2770,11 @@ def should_use_tensor_core(
 ) -> bool:
     """
     Determine whether to use tensor cores for attention computation.
+
+    中文：decode wrapper 创建时就要决定 CUDA core 还是 Tensor Core。
+    GQA group size >= 4 或 FP8 KV 时 Tensor Core 更划算；否则 CUDA core
+    的 decode kernel 更合适。环境变量 ``SGLANG_FLASHINFER_USE_TENSOR_CORE``
+    可强制覆盖。
 
     Args:
         kv_cache_dtype: Data type of the KV cache

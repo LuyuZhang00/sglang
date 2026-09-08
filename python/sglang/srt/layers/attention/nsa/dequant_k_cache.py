@@ -1,4 +1,8 @@
 # [Deprecated] Re-export shim for backward compatibility. Use dsa.dequant_k_cache instead.
+"""兼容转发：从 FP8 / FP4 paged index-K cache 反量化，供 dense 或 gather 路径用。
+
+实现已迁到 ``kernels.ops.attention.dsa.dequant_k_cache``。
+"""
 import warnings
 
 warnings.warn(

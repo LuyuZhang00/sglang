@@ -11,7 +11,119 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""A scheduler that manages a tensor parallel GPU worker."""
+"""GPU-side continuous-batching orchestrator for one parallel rank.
+
+HTTP / Engine entrypoints tokenize on CPU. Model forward, KV allocation, and
+sampling happen on GPUs that must stay saturated. ``Scheduler`` is the per-rank
+process that owns one ``TpModelWorker`` / ``ModelRunner`` and, every iteration,
+decides which requests form the next ``ScheduleBatch``.
+
+TokenizerManager never talks to ModelRunner directly. It only sends already-
+tokenized IPC messages (``TokenizedGenerateReqInput`` and control RPCs) to this
+process. Without Scheduler there is no continuous batching: prefills would
+block decodes, KV pages would leak, and TP / PP / DP ranks would not share a
+single control plane.
+
+This file is the composition root. Domain logic lives in collaborators
+(``TpModelWorker``, radix cache, overlap future map, PD-disagg queues, ...).
+``__init__`` only sequences ``init_*`` / ``maybe_init_*`` helpers so forks can
+override one piece. Mixins cover PD-disagg, pipeline parallel, multiplex,
+diffusion-LLM, and MLX overlap.
+
+Entry point: :func:`run_scheduler_process` is the ``multiprocessing.Process``
+target spawned by ``Engine._launch_scheduler_processes`` (or the DP controller
+/ Ray actor). It publishes runtime context, constructs ``Scheduler``,
+handshakes with the parent over ``pipe_writer``, then blocks in
+:meth:`Scheduler.run_event_loop`.
+
+Process topology::
+
+    Client ──HTTP/gRPC──► TokenizerManager ──ZMQ req──► Scheduler (this process)
+                              ▲                            │
+                              │ ZMQ text                   │ ZMQ output ids
+                              └──────── Detokenizer ◄──────┘
+                                                           │
+    Engine ──mp.Process / Pipe handshake───────────────────┤
+                                                           ▼
+                                                    TpModelWorker
+                                                           ▼
+                                                     ModelRunner / GPU
+
+When ``dp_size > 1`` (or elastic EP), Engine launches a DataParallelController
+instead of Scheduler ranks; the controller then spawns one Scheduler process
+per (DP, TP, PP) replica.
+
+Event-loop tick (normal)::
+
+    recv_requests → process_input_requests → get_next_batch_to_run
+          → run_batch (GPU forward) → process_batch_result → stream output
+
+Overlap mode pipelines CPU result processing of batch N-1 with GPU forward of
+batch N. Prefill is preferred over decode when both are eligible (better TTFT
+while keeping the decode batch alive via merge).
+
+Parallel ranks passed into this process (outermost → innermost)::
+
+    Attention:  global TP  →  DP-attn  →  ATTN_CP  →  ATTN_TP
+    MoE:        global TP  →  MOE_DP   →  EP       →  MOE_TP
+
+----------------------------------------------------------------------
+中文说明：本文件为什么存在、它在整条 serving 链路里做什么
+----------------------------------------------------------------------
+
+HTTP/gRPC 入口和 TokenizerManager 跑在 CPU 进程里，负责把文本变成 token。
+真正的模型前向、KV 分配和采样必须在 GPU 上持续进行，否则 GPU 会空转。
+``Scheduler`` 就是「每个并行 rank 一个」的 GPU 侧编排进程：它独占一个
+``TpModelWorker`` / ``ModelRunner``，并在每一拍决定哪些请求组成下一个
+``ScheduleBatch``。
+
+TokenizerManager 从不直接调用 ModelRunner。它只通过 ZMQ 把已经 tokenize
+好的 ``TokenizedGenerateReqInput`` 以及控制 RPC 发给本进程。如果没有
+Scheduler，就没有 continuous batching：新的 prefill 会堵住正在 decode 的
+请求，KV page 无法统一回收，TP / PP / DP 各 rank 也没有统一的控制面。
+
+本文件是 composition root（组装根），领域逻辑放在协作对象里
+（``TpModelWorker``、radix cache、overlap future map、PD-disagg 队列等）。
+``__init__`` 只按顺序调用 ``init_*`` / ``maybe_init_*``，方便下游 fork
+只覆盖其中一个组件。Mixin 覆盖 PD 分离、流水线并行、PD-multiplex、
+diffusion-LLM 和 MLX overlap。
+
+进程入口是 :func:`run_scheduler_process`，由 Engine 用 ``mp.Process`` 拉起
+（``dp_size > 1`` 时由 DataParallelController 再 spawn；Ray 模式下由 actor
+代替）。它先 ``publish`` 运行时配置、构造 ``Scheduler``、用 ``pipe_writer``
+向父进程握手就绪，然后阻塞在 :meth:`Scheduler.run_event_loop`。
+
+进程拓扑::
+
+    客户端 ──HTTP/gRPC──► TokenizerManager ──ZMQ 已分词请求──► Scheduler（本进程）
+                                ▲                                  │
+                                │ ZMQ 文本                         │ ZMQ token id
+                                └──────── Detokenizer ◄────────────┘
+                                                                   │
+    Engine ──mp.Process / Pipe 握手────────────────────────────────┤
+                                                                   ▼
+                                                            TpModelWorker
+                                                                   ▼
+                                                             ModelRunner / GPU
+
+``dp_size > 1``（或 Elastic EP）时，Engine 不直接 spawn Scheduler，而是
+启动 DataParallelController；控制器再为每个 (DP, TP, PP) 副本 spawn 一个
+Scheduler 进程。
+
+正常事件循环每一拍::
+
+    收请求 → 处理输入 → 选出下一批
+          → GPU 前向 → 处理结果 → 流式回传 token
+
+Overlap 模式把第 N-1 批的 CPU 结果处理与第 N 批的 GPU 前向重叠。
+prefill 和 decode 都就绪时优先跑 prefill（改善 TTFT），decode batch 通过
+merge 继续活着。
+
+传入本进程的并行 rank（由外到内）::
+
+    Attention:  全局 TP  →  DP-attn  →  ATTN_CP  →  ATTN_TP
+    MoE:        全局 TP  →  MOE_DP   →  EP       →  MOE_TP
+"""
 
 import dataclasses
 import faulthandler
@@ -353,12 +465,18 @@ logger = logging.getLogger(__name__)
 
 
 def _prewarm_hccl_group(device, group, device_module):
+    """NPU 上用一次 all_reduce 预热 HCCL communicator。
+
+    第一次集合通信会触发底层建链，放在 serving 热路径会把首包延迟打高；
+    仅 DeepSeek-V4 + NPU 需要，见 ``maybe_init_hccl_dp_prewarm``。
+    """
     warmup_tensor = torch.zeros(1, dtype=torch.int32, device=device)
     torch.distributed.all_reduce(warmup_tensor, group=group)
     device_module.synchronize()
 
 
 # Test retract decode for debugging purposes
+# 人为制造 decode retract，用来测 KV 满时把请求踢回 waiting_queue 的路径。
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
@@ -398,7 +516,44 @@ class Scheduler(
     SchedulerDllmMixin,
     SchedulerMlxOverlapMixin,
 ):
-    """A scheduler that manages a tensor parallel GPU worker."""
+    """Per-rank continuous-batching loop that owns one GPU worker.
+
+    Exists so serving can interleave prefill admission, decode continuation,
+    KV-cache management, and IPC in a single thread next to the GPU. Ranks
+    share work via NCCL; only rank 0 of each attention-TP / CP / PP slice
+    owns the tokenizer ZMQ sockets (see :meth:`init_ipc_channels`).
+
+    Core state after :meth:`init_running_status`:
+
+    * ``waiting_queue`` — admitted but not yet running ``Req`` objects.
+    * ``running_batch`` — live decode (or prefill-only) ``ScheduleBatch``.
+    * ``last_batch`` — previous forward; overlap mode processes its result
+      while the current forward is in flight.
+    * ``chunked_req`` — long prefill currently split across iterations.
+
+    Mixins add PD-disagg bootstrap/transfer loops, pipeline-parallel
+    microbatches, PD-multiplex, diffusion-LLM staging, and MLX overlap.
+
+    中文：每个并行 rank 上的 continuous-batching 循环，独占一块 GPU worker。
+
+    存在的理由：推理 serving 必须在「贴近 GPU 的单线程」里交织四件事——
+    接纳新 prefill、延续已有 decode、管理 KV cache、收发 IPC。多线程拆开这些
+    步骤会引入锁和跨流同步；放进独立进程则让 Tokenizer/HTTP 崩溃不影响 GPU
+    侧状态。各 rank 用 NCCL 共享计算；每个 attention-TP / CP / PP 切片里
+    只有 rank 0 持有 tokenizer ZMQ socket（见 :meth:`init_ipc_channels`），
+    其余 rank 通过 CPU 进程组广播拿到同一批请求，保证并行集合通信对齐。
+
+    :meth:`init_running_status` 之后的核心状态：
+
+    * ``waiting_queue`` — 已准入、尚未进入 running 的 ``Req``。
+    * ``running_batch`` — 正在 decode（或纯 prefill）的 ``ScheduleBatch``。
+    * ``last_batch`` — 上一拍前向；overlap 模式下在当前 GPU 前向飞行时
+      处理它的 CPU 结果。
+    * ``chunked_req`` — 被切成多拍执行的超长 prefill。
+
+    Mixin 负责 PD 分离的 bootstrap/传输循环、PP microbatch、PD-multiplex、
+    diffusion-LLM staging 和 MLX overlap，避免把这些变体塞进主循环。
+    """
 
     def __init__(
         self,
@@ -412,18 +567,73 @@ class Scheduler(
         moe_dp_rank: int,
         dp_rank: Optional[int],
     ):
+        """Wire collaborators for this rank. No event loop yet.
+
+        Args:
+            server_args: Full launch config. :func:`publish` already ran in
+                :func:`run_scheduler_process`, so bag getters (``get_schedule``,
+                ``get_parallel``, ...) are valid.
+            port_args: ZMQ IPC paths and the NCCL init port for this instance
+                (or this DP replica). Built by ``PortArgs.init_new``.
+            gpu_id: Device index this process binds to, after
+                ``maybe_reindex_device_id`` CUDA_VISIBLE_DEVICES remapping.
+            tp_rank: This process's tensor-parallel rank in ``[0, tp_size)``.
+                Also the key used to derive ATTN_CP / MOE_DP / MOE_EP ranks.
+            moe_ep_rank: Expert-parallel rank inside the MoE hierarchy
+                (global TP → MOE_DP → EP → MOE_TP).
+            pp_rank: Pipeline-parallel stage. Rank 0 is the first stage
+                (receives tokenized inputs); the last stage produces logits.
+            attn_cp_rank: Attention context-parallel rank. Splits the KV
+                sequence across ranks; 0 when CP is disabled.
+            moe_dp_rank: MoE data-parallel rank (replicas of the expert
+                mesh). Distinct from serving ``dp_rank``.
+            dp_rank: Data-parallel replica id, or ``None`` when Engine
+                launched this process directly (``dp_size == 1``). Set by
+                DataParallelController / ``SGLANG_DP_RANK`` for multi-DP.
+
+        中文：为本 rank 接线全部协作对象，此时还不进入事件循环。
+
+        构造函数是编排器，不是算法本体：按固定顺序调用 ``init_*`` /
+        ``maybe_init_*``，让 fork 可以只覆盖某一个组件（tokenizer、KV、
+        IPC、worker）。真正的调度策略、前向、结果处理都在后续方法里。
+
+        参数含义：
+            server_args: 完整启动配置。:func:`run_scheduler_process` 里已经
+                调用过 :func:`publish`，因此 ``get_schedule`` / ``get_parallel``
+                等 bag getter 在这里是合法的。
+            port_args: 本实例（或本 DP 副本）的 ZMQ IPC 路径和 NCCL 初始化端口，
+                由 ``PortArgs.init_new`` 生成。
+            gpu_id: 本进程绑定的设备号，已经过 ``maybe_reindex_device_id``
+                对 CUDA_VISIBLE_DEVICES 的重映射。
+            tp_rank: 本进程在 ``[0, tp_size)`` 中的张量并行 rank，也是推导
+                ATTN_CP / MOE_DP / MOE_EP rank 的主键。
+            moe_ep_rank: MoE 层级里的 expert-parallel rank
+                （全局 TP → MOE_DP → EP → MOE_TP）。
+            pp_rank: 流水线并行阶段。0 是第一段（收 tokenized 输入）；
+                最后一段产出 logits。
+            attn_cp_rank: Attention context-parallel rank，把 KV 序列切到
+                多个 rank；关闭 CP 时为 0。
+            moe_dp_rank: MoE 数据并行 rank（expert mesh 的副本），与 serving
+                侧的 ``dp_rank`` 不是同一件事。
+            dp_rank: 数据并行副本 id。Engine 直接拉起本进程时（``dp_size == 1``）
+                为 ``None``；多 DP 时由 DataParallelController 或
+                ``SGLANG_DP_RANK`` 填入。
+        """
         # NOTE: KEEP THE FOLLOWING CODE STYLE for this function:
         # Keep __init__ as an orchestrator: sequence init_* and maybe_init_* calls
         # with minimal glue. Move substantial component-specific logic into
         # dedicated methods instead of adding inline blocks here.
+        # 中文：__init__ 只做编排。领域逻辑放到独立 init_* 方法里，fork 才能按组件覆盖。
         self.init_startup_timing_begin()
         self.is_initializing = True
         # init_soft_watchdog starts a daemon thread that reads these on its first tick.
+        # 软 watchdog 的守护线程在第一拍就会读这两个字段，必须在启动线程前赋初值。
         self.forward_ct: int = 0
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
         self.init_soft_watchdog(server_args)
 
         # Parse args
+        # 把频繁读取的开关从 bag getter 快照到 self.*，避免热路径反复查运行时上下文。
         self.server_args = server_args
         self.nccl_port = port_args.nccl_port
         self.schedule_policy = get_schedule().schedule_policy
@@ -467,6 +677,7 @@ class Scheduler(
         self.enable_unified_memory = get_memory().enable_unified_memory
 
         # Distributed rank info
+        # 把全局 TP 再切成 DP-attn / ATTN_CP / ATTN_TP，供后续 IPC 与集合通信使用。
         attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
             compute_dp_attention_world_info(
                 get_parallel().enable_dp_attention,
@@ -476,6 +687,8 @@ class Scheduler(
                 configured_attn_cp_size(),
             )
         )
+        # ParallelState 是本 rank 的并行身份卡，后续 worker / KV / IPC 都只读它，
+        # 不再各自从 server_args 重新推导，避免 fork 后出现不一致。
         self.ps = ParallelState(
             tp_rank=tp_rank,
             tp_size=configured_tp_size(),
@@ -499,16 +712,19 @@ class Scheduler(
         )
 
         # Init model configs
+        # 先读 HF config，后续 tokenizer / worker / KV 都依赖 model_config。
         self.init_model_config()
 
         # Init metrics stats
         self.init_metrics_collector(tp_rank, pp_rank, dp_rank)
 
         # Init inter-process communication
+        # 尽早建 ZMQ，非 rank0 会跳过 tokenizer socket；idle sleeper 依赖这些 socket。
         self.init_ipc_channels(port_args)
         self.init_idle_sleeper()
 
         # Init ZBAL, switch allocator should before any torch alloc action
+        # NPU 必须在任何 torch 分配之前切换 allocator，否则后续权重/KV 走错内存池。
         self.init_zbal_on_npu()
 
         # Init PD-multiplexing context
@@ -529,12 +745,14 @@ class Scheduler(
         maybe_revert_pr_fix()
 
         # Launch a model worker and draft model worker if using speculative decoding
+        # 加载权重、分配 KV、捕获 CUDA Graph；这是启动路径里最重的一步。
         self.init_model_worker()
 
         if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
             time.sleep(t)
 
         # Init cache and memory pool
+        # KV / radix cache 在 worker 之后构建：需要已经存在的 token pool 与通信组。
         result = kv_cache_builder.build_kv_cache(
             server_args=self.server_args,
             model_config=self.model_config,
@@ -597,6 +815,7 @@ class Scheduler(
             self.decode_offload_manager = None
 
         # Init running status
+        # waiting_queue / running_batch / last_batch 是事件循环的三块核心状态。
         self.init_running_status()
 
         # Init chunked prefill
@@ -608,6 +827,7 @@ class Scheduler(
         self.init_metrics_reporter(tp_rank, pp_rank, dp_rank)
 
         # Init schedule policy and new token estimation
+        # FCFS / LPM 等准入策略以及 decode token 占用估计，决定下一拍能塞进多少请求。
         self.init_schedule_policy()
 
         # Init watchdog, memory saver, input blocker and recv skipper
@@ -623,12 +843,16 @@ class Scheduler(
         # so the registry is accepting once this returns.) Must also precede
         # the request receiver, which reads self.recv_from_tokenizer to pick
         # its ingress transport.
+        # 中文：Rust 前端必须先于 PD-disagg 和 request receiver。Prefill 侧的
+        # KV bootstrap registry 挂在同一个 listener 上，KVManager 会同步注册；
+        # receiver 也要根据 recv_from_tokenizer 选择入口传输。
         self.maybe_init_rust_server()
 
         # Init prefill-decodedisaggregation
         self.init_disaggregation()
 
         # Init overlap schedule
+        # future_map / 双 CUDA stream：让第 N 批 GPU 前向和第 N-1 批 CPU 收尾重叠。
         self.init_overlap()
 
         # Init Ngram Embedding
@@ -640,6 +864,7 @@ class Scheduler(
         self.init_weight_updater()
 
         # Init request dispatcher
+        # 按消息类型分发：生成/embedding 进 waiting_queue，其余是控制 RPC。
         self.init_request_dispatcher()
 
         # Init LoRA drainer for fair scheduling
@@ -752,6 +977,13 @@ class Scheduler(
         self.metrics_collector = self.metrics_collector_context.collector
 
     def init_ipc_channels(self, port_args: PortArgs):
+        """建立本 rank 与 Tokenizer / Detokenizer / RPC 之间的 ZMQ 通道。
+
+        只有 PP=0 且 ATTN_TP=0 且 ATTN_CP=0 的 rank 真正 bind/connect tokenizer
+        socket。其余 rank 靠进程组广播拿到同一批请求，这样 TP/CP 集合通信才对齐。
+        skip_tokenizer_init 必须用构造时快照，不能二次读 bag，否则 IPC 与
+        tokenizer 初始化会对不上。
+        """
         is_rank_zero = (
             self.ps.pp_rank == 0
             and self.ps.attn_tp_rank == 0
@@ -791,6 +1023,11 @@ class Scheduler(
             logger.warning("load snapshot writer init failed: %s", e)
 
     def init_idle_sleeper(self) -> None:
+        """空闲时阻塞在 ZMQ socket 上，避免热循环空转占满 CPU。
+
+        非入口 rank 没有 tokenizer socket，不创建 sleeper；有请求到达时
+        poll 立刻返回，不影响延迟。
+        """
         if (
             self.ps.pp_rank == 0
             and self.ps.attn_tp_rank == 0
@@ -821,6 +1058,12 @@ class Scheduler(
             logger.warning("load snapshot publish failed: %s", e)
 
     def init_tokenizer(self):
+        """在 Scheduler 进程内按需加载 tokenizer / processor。
+
+        主路径的分词在 TokenizerManager 完成；这里再加载一份，是为了
+        skip_tokenizer_init=False 时做长度校验、多模态 pad、以及把
+        detokenize 所需的特殊 token 信息留在 GPU 侧。
+        """
         server_args = self.server_args
         self.is_generation = self.model_config.is_generation
 
@@ -919,6 +1162,12 @@ class Scheduler(
         self.require_mlp_sync = require_mlp_sync(self.server_args)
 
     def init_tp_model_worker(self):
+        """构造本 rank 的目标模型 worker（权重 + ModelRunner）。
+
+        FIXME 注释仍成立：worker 初始化目前嵌在 Scheduler 里，是因为
+        NCCL 端口、gpu_id、ParallelState 都由本进程持有。MLX 走独立
+        worker 类，避免把 Apple GPU 路径塞进 CUDA TpModelWorker。
+        """
         worker_kwargs = dict(
             server_args=self.server_args,
             gpu_id=self.ps.gpu_id,
@@ -937,6 +1186,13 @@ class Scheduler(
             self.tp_worker = TpModelWorker(**worker_kwargs)
 
     def maybe_init_draft_worker(self):
+        """投机解码时再拉一个 draft worker，与 target 共享同一块 GPU。
+
+        draft 不复制一份完整 server_args 差分配置：context length、
+        load format、attention backend 都在各自 runner 上解析，避免
+        两份配置漂移。无投机算法时 draft_worker 为 None，后续
+        model_worker 直接指向 tp_worker。
+        """
         if self.spec_algorithm.is_none():
             self.draft_worker = None
             self.external_corpus_manager = None
@@ -1007,6 +1263,13 @@ class Scheduler(
             self.draft_worker.init_cuda_graphs()
 
     def init_model_worker(self):
+        """加载权重、分配 KV、初始化 attention backend 并捕获 CUDA Graph。
+
+        顺序不能乱：先 target worker，再 draft worker（draft 要挂到
+        target 上）；内存池必须在 attention backend / CUDA Graph 之前，
+        因为 Graph 捕获会固化 KV buffer 地址。投机解码时对外的
+        ``model_worker`` 指向 draft，由它编排 verify + draft extend。
+        """
         # Load model weights.
         self.init_tp_model_worker()
         if self.server_args.is_startup_weight_load_overlap:
@@ -1152,6 +1415,13 @@ class Scheduler(
         self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
 
     def init_running_status(self):
+        """初始化事件循环要用的可变状态。
+
+        ``waiting_queue`` 是准入后尚未 running 的请求；``running_batch`` 是
+        当前 decode（或纯 prefill）batch；``last_batch`` 给 overlap 用来
+        在下一拍 GPU 前向飞行时处理上一拍结果。``gracefully_exit`` 由
+        ShutdownReq 置位，用来干净地跳出循环而不是杀进程。
+        """
         # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
         self.gracefully_exit = False
         self.waiting_queue: List[Req] = []
@@ -1174,6 +1444,13 @@ class Scheduler(
         self._engine_paused = False
 
     def init_chunked_prefill(self):
+        """配置超长 prefill 的切块执行。
+
+        一次把整段 prompt 塞进 GPU 会撑爆 KV 或拖垮 TTFT，所以把长
+        prefill 切成多拍。chunked_req 跨 iteration 存活，直到最后一块
+        完成才 merge 进 running_batch。多模态 Transformers backend 关掉
+        chunked prefill，避免半截图像 token 对不齐。
+        """
         self.chunked_prefill_size = get_schedule().chunked_prefill_size
         self.prefill_decode_interval = get_schedule().prefill_decode_interval
         self._prefill_decode_interval_remaining = 0
@@ -1249,6 +1526,12 @@ class Scheduler(
         )
 
     def init_schedule_policy(self):
+        """初始化 waiting_queue 的排序策略和新 token 占用估计。
+
+        SchedulePolicy（FCFS / LPM / priority）决定先服务谁；
+        NewTokenRatioTracker 估计 decode 还会再写多少 KV，供 PrefillAdder
+        判断还能不能再塞 prefill。PrefillDelayer 是可选的反压阀。
+        """
         # Init schedule policy and new token estimation
         self.policy = SchedulePolicy(
             self.schedule_policy,
@@ -1301,6 +1584,11 @@ class Scheduler(
             )
 
     def init_watch_dog_memory_saver_input_blocker(self):
+        """启动卡死检测、可选 memory saver，以及同机 batch-gen 的输入门闩。
+
+        watchdog 超时说明 GPU 前向或集合通信卡住，应主动自杀而不是
+        让健康检查一直 200。input_blocker 仅在共置 batch-gen 时启用。
+        """
         # Start watchdog thread
         self.watchdog = create_scheduler_watchdog(
             self, watchdog_timeout=get_device().watchdog_timeout
@@ -1324,6 +1612,12 @@ class Scheduler(
             configure_gc_logger()
 
     def init_disaggregation(self):
+        """按 PD 角色初始化 bootstrap / 传输队列。
+
+        普通合设模式（NULL）什么都不建。Prefill 实例要能把 KV 发给 Decode
+        实例，Decode 实例要先预分配槽位再收 KV。队列实现在 mixin 里，
+        这里只接线，避免主循环直接依赖 RDMA/NIXL 细节。
+        """
         self.mm_receiver = None
         self.disagg_prefill_bootstrap_queue = None
         self.disagg_prefill_inflight_queue = None
@@ -1484,6 +1778,12 @@ class Scheduler(
             )
 
     def init_overlap(self):
+        """准备 overlap 调度所需的 CUDA stream 和 FutureMap。
+
+        FutureMap 在非 overlap 下也启用，用来在 CPU 与 GPU 之间接力
+        input_ids。真正的双 stream 重叠只在 ``enable_overlap`` 时打开：
+        ``forward_stream`` 跑模型，``schedule_stream`` 准备下一拍 batch。
+        """
         self.device_module = torch.get_device_module(self.device)
 
         # FutureMap is always-on: input_ids relay used in both modes.
@@ -1570,6 +1870,13 @@ class Scheduler(
         )
 
     def init_request_dispatcher(self):
+        """按 IPC 消息类型分发到对应 handler。
+
+        热路径是 TokenizedGenerate / Embedding；其余是缓存刷新、权重更新、
+        LoRA 加载、profile、shutdown 等控制面。用 TypeBasedDispatcher 而
+        不是一长串 if-elif，是为了新增消息类型时只加一行映射，并让
+        未知类型立刻失败而不是静默丢弃。
+        """
         self._request_dispatcher = TypeBasedDispatcher(
             [
                 (TokenizedGenerateReqInput, self.handle_generate_request),
@@ -1689,6 +1996,12 @@ class Scheduler(
 
         This method provides the initialization info needed by the tokenizer manager
         and other components to verify the scheduler is ready.
+
+        中文：通过 Pipe 回给父进程（Engine 或 DP controller）的就绪握手。
+        父进程必须等到 ``status=ready`` 才对外接流量；同时带回
+        ``max_total_num_tokens`` / ``max_req_input_len``，Tokenizer 用它们
+        在 CPU 侧做长度校验，避免超长请求已经进 GPU 才被拒绝。
+        ``startup_time`` 用于启动耗时拆解。
         """
         result_dict = {
             "status": "ready",
@@ -1702,6 +2015,8 @@ class Scheduler(
     def release_host_resources(self) -> None:
         # Release pinned host buffers in userspace on graceful shutdown; see
         # HostKVCache.destroy. Called from run_scheduler_process's finally.
+        # 只在优雅退出时调用：pinned host buffer / HiCache 需要显式归还，
+        # 否则进程退出后仍可能占着 PINNED 内存直到被 OS 回收。
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.destroy()
         self.tree_cache.release_host_resources()
@@ -1715,6 +2030,12 @@ class Scheduler(
 
         Sets up the schedule stream and dispatches to the appropriate event loop.
         The event loop blocks until shutdown.
+
+        中文：事件循环入口。先装 Triton lazy-load 监视（捕获后首次加载
+        kernel 会拖垮 serving），再创建独立的 ``schedule_stream``，让
+        CPU 侧准备 batch 与 GPU 前向可以重叠。真正的循环体由
+        :func:`dispatch_event_loop` 按 PP / overlap / PD-disagg / MLX
+        选出，本方法本身不实现调度算法。
         """
         # Engine init (graph capture, warmups) is done; from here on any
         # Triton kernel device-load is a lazy first-use at serving time.
@@ -1763,18 +2084,28 @@ class Scheduler(
 
     @DynamicGradMode()
     def event_loop_normal(self):
-        """A normal scheduler loop."""
+        """A normal scheduler loop.
+
+        中文：最朴素的一拍一拍循环，GPU 前向和 CPU 结果处理串行。
+
+        每一拍：收 IPC → 把请求放进 waiting_queue → 选出下一批 →
+        ``run_batch`` 阻塞到 GPU 完成 → ``process_batch_result`` 回收 KV
+        并回传 token。没有 overlap 时实现简单、易于推理正确性；代价是
+        CPU 收尾会让 GPU 空等。空闲时走 ``on_idle`` 做自检并重置状态。
+        """
         while True:
             if self.gracefully_exit:
                 break
 
             # Receive requests
+            # rank0 从 ZMQ 拉消息，其余 rank 通过进程组拿到同一批。
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
 
             # Get the next batch to run
+            # 可能是新 prefill、继续 decode，或 None（空闲）。
             plan = self.get_next_batch_to_run(
                 running_batch=self.running_batch, last_batch=self.last_batch
             )
@@ -1798,7 +2129,16 @@ class Scheduler(
 
     @DynamicGradMode()
     def event_loop_overlap(self):
-        """A scheduler loop that overlaps the CPU processing and GPU computation."""
+        """A scheduler loop that overlaps the CPU processing and GPU computation.
+
+        中文：把第 N 批 GPU 前向和第 N-1 批 CPU 结果处理重叠，提高 GPU 利用率。
+
+        ``result_queue`` 保存尚未处理的 (batch, result)。本拍 ``run_batch``
+        只把 kernel 提交到 ``forward_stream`` 就返回，随后立刻处理上一拍
+        结果。采样（grammar / structured output）必须等上一拍 FSM 推进完，
+        所以 ``launch_batch_sample_if_needed`` 放在 ``pop_and_process`` 之后。
+        连续两拍都是 prefill 时可以关掉 overlap，优先保证第一批的 TTFT。
+        """
         self.result_queue: Deque[
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
@@ -1847,12 +2187,14 @@ class Scheduler(
                 batch_result = self.run_batch(batch)
                 # Fence result processing behind this forward's shared reads.
                 self._apply_war_barrier()
+                # copy() 快照 batch：后续 waiting_queue 变更不能污染正在飞行的结果。
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
                 self._sched_idled = True
 
             # Process the last batch
+            # 默认处理上一拍；若本拍刚因连续 prefill 关掉 overlap，上面已经处理过了。
             if self.last_batch:
                 if not disable_overlap_for_batch:
                     pop_and_process()
@@ -1879,6 +2221,9 @@ class Scheduler(
         # In DP attention mode, use the globally synchronized is_extend_in_batch
         # so all DP ranks make the same overlap decision (avoiding deadlock).
         # In non-DP mode, use the local forward_mode directly.
+        # 中文：连续 prefill 关掉 overlap，让第一批的 CPU 收尾立刻完成、尽快出首 token。
+        # DP-attn 必须用全局同步后的 is_extend_in_batch，否则各 rank 对 overlap
+        # 决策不一致会在 MLP all-reduce 上死锁。
         if self.require_mlp_sync:
             is_extend = lambda b: b and b.is_extend_in_batch
         else:
@@ -1921,6 +2266,12 @@ class Scheduler(
 
     @scheduler_nvtx_method("scheduler.process_input_requests")
     def process_input_requests(self, recv_reqs: List):
+        """把本拍从 ZMQ/RPC 收到的消息交给 TypeBasedDispatcher。
+
+        健康检查请求在服务忙碌时直接记下 IPC 回传地址，避免长 prefill
+        堵住 health probe。真正的生成请求在 handler 里变成 ``Req`` 进入
+        waiting_queue 或 PD-disagg 队列。
+        """
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
         if get_mm().mm_feature_transport == "cuda_vmm":
@@ -2056,6 +2407,12 @@ class Scheduler(
         self.idle_sleeper = RustServerIdleSleeper(rust_server)
 
     def init_request_receiver(self) -> None:
+        """封装「从 tokenizer/RPC/多模态通道收消息并在 TP 组内广播」。
+
+        非 rank0 没有 ZMQ PULL socket，receiver 会走进程组 broadcast，
+        保证同一拍所有 rank 看到同一批请求。max_recv_per_poll 限制单拍
+        收取数量，避免一次把 waiting_queue 灌满拖垮本拍调度。
+        """
         self.request_receiver = SchedulerRequestReceiver(
             recv_from_tokenizer=self.recv_from_tokenizer,
             recv_from_rpc=self.ipc_channels.recv_from_rpc,
@@ -2079,6 +2436,11 @@ class Scheduler(
         )
 
     def init_dp_attn_adapter(self) -> None:
+        """DP-attention 下让各 rank 对「本拍是 prefill / decode / idle」达成一致。
+
+        MLP all-reduce 要求每个 rank 都进入同一次 forward。某个 DP rank
+        没有本地请求时必须发 idle batch 去陪跑，否则集合通信死锁。
+        """
         # Spec workers have no .model_runner of their own; the prefill graph
         # runner that votes belongs to the target model.
         target_worker = (
@@ -2197,6 +2559,11 @@ class Scheduler(
         )
 
     def init_output_streamer(self) -> None:
+        """把 GPU 侧产出的 token id 经 ZMQ 送给 Detokenizer。
+
+        Scheduler 不把 id 直接发回 Tokenizer，是为了解耦「采样」和
+        「detokenize + 流式 HTTP」。只有入口 rank 真正 send。
+        """
         self.output_streamer = self.get_output_streamer_class()(
             send_to_detokenizer=self.ipc_channels.send_to_detokenizer,
             tree_cache=self.tree_cache,
@@ -2213,6 +2580,12 @@ class Scheduler(
         return SchedulerOutputStreamer
 
     def init_batch_result_processor(self) -> None:
+        """把「前向结果 → 更新 Req / 回收 KV / 流式输出」从主循环抽出去。
+
+        decode 与 prefill 的收尾逻辑很长，留在 Scheduler 会让事件循环
+        不可读。processor 通过回调拿 tree_cache / streamer，不反向持有
+        整个 Scheduler。
+        """
         self.batch_result_processor = SchedulerBatchResultProcessor(
             is_generation=self.is_generation,
             disaggregation_mode=self.disaggregation_mode,
@@ -2432,6 +2805,13 @@ class Scheduler(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
+        """把 Tokenizer 送来的已分词生成请求变成 ``Req`` 并入队。
+
+        这是热路径入口：校验长度、处理 session / 多模态 / PD bootstrap
+        元数据，然后交给 ``_add_request_to_queue``。普通模式进
+        ``waiting_queue``；prefill 实例进 bootstrap 队列；decode 实例进
+        prealloc 队列。本函数不做 GPU 前向，只做 CPU 侧准入。
+        """
         # Route: normal request / session request / session-not-found
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
@@ -2798,6 +3178,13 @@ class Scheduler(
                 )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
+        """按当前 disagg 模式把请求放到对应队列。
+
+        NULL：waiting_queue（本实例同时做 prefill+decode）。
+        PREFILL：bootstrap 队列，等 KV 传输端点就绪。
+        DECODE：prealloc 队列，先占 KV 槽再收远端 KV。
+        retracted 请求走同一入口，避免 decode OOM 回退路径另写一套入队。
+        """
         if not self._set_or_validate_priority(req):
             return
         if self.disaggregation_mode == DisaggregationMode.NULL:
@@ -3095,6 +3482,19 @@ class Scheduler(
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
+        """选出下一拍要送到 GPU 的 batch。这是 continuous batching 的核心。
+
+        逻辑顺序：
+        1. 把上一拍已完成的 prefill merge 进 ``running_batch``（chunked
+           请求先摘出去，避免半截 prefill 被当成 decode）；
+        2. 尝试从 ``waiting_queue`` 组一个新的 prefill batch；
+        3. 有新 prefill 就优先跑它（改善 TTFT），否则继续 decode；
+        4. DP-attn 下通过 MLP sync 让各 rank 对齐 prefill/decode/idle，
+           避免有的 rank 在做 all-reduce 时别的 rank 已经进了下一拍。
+
+        返回 ``NextBatchPlan``：``batch_to_run`` 是本拍 GPU 输入，
+        ``running_batch`` 是更新后的 decode 集合。
+        """
         self.process_pending_chunked_abort()
 
         if self.enable_fpm:
@@ -3105,6 +3505,7 @@ class Scheduler(
             self.dllm_manager.filter_finished_reqs()
 
         # Merge the prefill batch into the running batch
+        # 上一拍的 extend 完成后，活下来的请求变成 decode，并入 running_batch。
         chunked_req_to_exclude = set()
 
         if self.dllm_config is not None and self.dllm_manager.any_staging_reqs():
@@ -3205,6 +3606,7 @@ class Scheduler(
 
         if new_batch is not None:
             # Run prefill first if possible
+            # 有新 prefill 就先跑：改善 TTFT，decode 请求仍留在 running_batch 里下一拍继续。
             ret = new_batch
         else:
             # Run decode (skip for prefill-only batches)
@@ -3238,6 +3640,12 @@ class Scheduler(
         return res
 
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
+        """从 waiting_queue 尝试组成一个新的 prefill batch。
+
+        PrefillDelayer 在 KV 占用偏高时推迟接纳新 prefill，给正在跑的
+        decode 留余量，避免 TTFT 优化把 ITL 打崩。真正的容量估算在
+        ``_get_new_batch_prefill_raw`` / ``PrefillAdder`` 里。
+        """
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
             # Get max usage across all pools for prefill delay decision
@@ -3269,6 +3677,12 @@ class Scheduler(
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
         running_batch: ScheduleBatch,
     ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
+        """按 KV 余量、running 上限、LoRA 槽位和调度策略挑选 prefill 请求。
+
+        ``running_batch.batch_is_full`` 为真且没有 chunked_req 时直接放弃，
+        避免每个空闲拍都扫描 waiting_queue。chunked 请求必须始终能继续，
+        否则 KV 槽位泄漏。grammar 未就绪的请求先不入 waiting_queue。
+        """
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
@@ -3579,7 +3993,13 @@ class Scheduler(
             )
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
-        """Update the current running decoding batch."""
+        """Update the current running decoding batch.
+
+        中文：准备下一拍 decode：滤掉已完成请求；KV 不够时 retract 部分
+        请求回 waiting_queue（释放 page，稍后重新 prefill 前缀）。这是
+        continuous batching 在显存压力下的安全阀：宁可拉长个别请求的
+        延迟，也不让整批 decode OOM 把服务打挂。
+        """
         initial_bs = batch.batch_size()
 
         batch.filter_batch()
@@ -3725,7 +4145,16 @@ class Scheduler(
         batch: ScheduleBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
-        """Run a batch."""
+        """Run a batch.
+
+        中文：把 ``ScheduleBatch`` 交给 ``model_worker`` 做 GPU 前向。
+
+        这是 Scheduler 与 ModelRunner 的边界：本方法负责 profiler、
+        overlap stream 同步、PD prefill 提前发送 prefix KV、以及把
+        投机解码 / embedding / 普通 generation 路由到对应 worker API。
+        真正的 attention / MLP / sampling kernel 都在 worker 内部。
+        overlap 模式下这里通常只提交 kernel，不等 GPU 完成。
+        """
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
         batch.launch_ts = time.monotonic()
@@ -4049,6 +4478,12 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        """处理一拍 GPU 前向的结果：回传 token、回收 KV、更新指标。
+
+        decode / prefill / PD-prefill / prebuilt / idle 走不同 processor。
+        overlap 模式下这段 CPU 工作与下一拍 GPU 前向重叠。trace flush
+        放在这里也是为了吃这段空闲 CPU。
+        """
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)
@@ -5052,6 +5487,7 @@ class Scheduler(
 
     def handle_shutdown(self, recv_req: ShutdownReq):
         # Break the event loop; the finally in run_scheduler_process releases resources.
+        # 只置位，不在这里释放 GPU：事件循环还要跑完当前拍，finally 里统一清理。
         self.gracefully_exit = True
         return None
 
@@ -5090,6 +5526,13 @@ class Scheduler(
 
 
 def dispatch_event_loop(scheduler: Scheduler):
+    """按并行模式和 PD-disagg 角色选出真正的事件循环实现。
+
+    主循环有多套变体（normal / overlap / PP / PD-prefill / PD-decode /
+    pdmux / MLX），是因为它们的「一拍」语义不同：PP 要推进 microbatch，
+    PD-prefill 要驱动 KV 传输，overlap 要维护 result_queue。把选择集中
+    在这里，``run_event_loop`` 只负责 stream 上下文。
+    """
     # The live PP property asserts before torch.distributed init (MLX stub).
     disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
     if disaggregation_mode == DisaggregationMode.NULL:
@@ -5135,53 +5578,70 @@ def configure_scheduler_process(
     """Configure scheduler worker logging and process title.
 
     display_* ranks are cosmetic; runtime ranks stay local.
+
+    中文：子进程落地后、构造 Scheduler 之前的进程级环境配置。
+
+    必须在这里做而不是在父进程做：进程名、logger 前缀、CPU affinity、
+    NUMA bind 都是 per-process 的。父进程 fork/spawn 出几十个 rank 后，
+    若日志都叫 ``scheduler``，排障几乎不可能。
+
+    ``display_*`` 只影响日志/进程名中展示的 rank（例如 Elastic EP 或
+    多节点时对外编号与本地 tp_rank 不同），真正参与集合通信的仍是
+    传入的运行时 rank。Router 场景下若环境变量 ``SGLANG_DP_RANK`` 存在，
+    会在这里补上 ``dp_rank``。
+
+    返回可能被环境变量改写过的 ``dp_rank``，调用方必须用返回值，
+    不能继续用入参。
     """
-    kill_itself_when_parent_died()
+        kill_itself_when_parent_died()
 
-    # Generate the logger prefix
-    if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
-        # [For Router] if env var "SGLANG_DP_RANK" exist, set dp_rank to the value of the env var
-        dp_rank = int(os.environ["SGLANG_DP_RANK"])
+        # Generate the logger prefix
+        # Router 场景下 Engine 不传 dp_rank，靠环境变量把本进程标成某个 DP 副本。
+        if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
+            # [For Router] if env var "SGLANG_DP_RANK" exist, set dp_rank to the value of the env var
+            dp_rank = int(os.environ["SGLANG_DP_RANK"])
 
-    shown_dp = display_dp_rank if display_dp_rank is not None else dp_rank
-    shown_tp = display_tp_rank if display_tp_rank is not None else tp_rank
-    shown_moe_ep = (
-        display_moe_ep_rank if display_moe_ep_rank is not None else moe_ep_rank
-    )
-
-    prefix = ""
-    if shown_dp is not None:
-        prefix += f" DP{shown_dp}"
-    if configured_pp_size() > 1:
-        prefix += f" PP{pp_rank}"
-    if configured_attn_cp_size() > 1:
-        prefix += f" ATTN_CP{attn_cp_rank}"
-    if configured_moe_dp_size() > 1:
-        prefix += f" MOE_DP{moe_dp_rank}"
-    if configured_tp_size() > 1:
-        prefix += f" TP{shown_tp}"
-    if get_parallel().ep_size > 1:
-        prefix += f" EP{shown_moe_ep}"
-
-    # Config the process
-    setproctitle.setproctitle(f"sglang::scheduler{prefix.replace(' ', '_')}")
-    faulthandler.enable()
-
-    # Configure the logger
-    configure_logger(server_args, prefix=prefix)
-    suppress_other_loggers()
-
-    # Set cpu affinity to this gpu process
-    if envs.SGLANG_SET_CPU_AFFINITY.get():
-        set_gpu_proc_affinity(
-            configured_pp_size(), configured_tp_size(), get_parallel().nnodes, gpu_id
+        shown_dp = display_dp_rank if display_dp_rank is not None else dp_rank
+        shown_tp = display_tp_rank if display_tp_rank is not None else tp_rank
+        shown_moe_ep = (
+            display_moe_ep_rank if display_moe_ep_rank is not None else moe_ep_rank
         )
-    if not envs.SGLANG_NUMA_BIND_V2.get():
-        numa_node = get_numa_node_if_available(server_args, gpu_id)
-        if numa_node is not None:
-            numa_bind_to_node(numa_node)
 
-    return dp_rank
+        prefix = ""
+        if shown_dp is not None:
+            prefix += f" DP{shown_dp}"
+        if configured_pp_size() > 1:
+            prefix += f" PP{pp_rank}"
+        if configured_attn_cp_size() > 1:
+            prefix += f" ATTN_CP{attn_cp_rank}"
+        if configured_moe_dp_size() > 1:
+            prefix += f" MOE_DP{moe_dp_rank}"
+        if configured_tp_size() > 1:
+            prefix += f" TP{shown_tp}"
+        if get_parallel().ep_size > 1:
+            prefix += f" EP{shown_moe_ep}"
+
+        # Config the process
+        # 进程名带上 DP/TP/PP 前缀，ps/top 才能区分几十个 scheduler 子进程。
+        setproctitle.setproctitle(f"sglang::scheduler{prefix.replace(' ', '_')}")
+        faulthandler.enable()
+
+        # Configure the logger
+        configure_logger(server_args, prefix=prefix)
+        suppress_other_loggers()
+
+        # Set cpu affinity to this gpu process
+        # 把本进程绑到靠近这张 GPU 的 CPU/NUMA 节点，降低 PCIe/HBM 拷贝延迟。
+        if envs.SGLANG_SET_CPU_AFFINITY.get():
+            set_gpu_proc_affinity(
+                configured_pp_size(), configured_tp_size(), get_parallel().nnodes, gpu_id
+            )
+        if not envs.SGLANG_NUMA_BIND_V2.get():
+            numa_node = get_numa_node_if_available(server_args, gpu_id)
+            if numa_node is not None:
+                numa_bind_to_node(numa_node)
+
+        return dp_rank
 
 
 def run_scheduler_process(
@@ -5199,9 +5659,104 @@ def run_scheduler_process(
     display_dp_rank: Optional[int] = None,
     display_moe_ep_rank: Optional[int] = None,
 ):
+    """每个 Scheduler 子进程的 ``multiprocessing.Process`` target。
+
+    为什么需要独立进程
+    ------------------
+    Tokenizer / HTTP 在 CPU 上跑，模型前向必须钉在一张 GPU 上。把二者
+    放进同一进程会互相抢 GIL、共享崩溃域，也无法给每个 TP/PP rank 绑
+    不同的 ``CUDA_VISIBLE_DEVICES``。因此 Engine（或 DataParallelController）
+    为每个 (DP, TP, PP, CP, EP) 组合 spawn 一个进程，本函数就是该进程
+    的入口。Ray 模式下 ``SchedulerActor`` 扮演同一角色，不再走 mp.Process。
+
+    谁调用它
+    --------
+    * ``dp_size == 1``：``Engine._launch_scheduler_processes`` 直接
+      ``mp.Process(target=run_scheduler_process, args=...)``。
+    * ``dp_size > 1`` 或 Elastic EP：Engine 只拉起 DataParallelController，
+      由控制器再为本节点的每个副本调用本函数。
+    * 测试可注入 ``run_scheduler_process_func``，生产路径默认就是本函数。
+
+    启动握手架构::
+
+        Engine / DP Controller          Scheduler 子进程（本函数）
+        ----------------------          -------------------------
+        mp.Process.start()  ─────────►  load_plugins()
+        阻塞读 pipe_reader              publish(server_args)
+                                        configure_scheduler_process(...)
+                                        Scheduler.__init__  # 加载权重/KV/Graph
+        ◄──── pipe_writer.send(ready) ──  get_init_info()
+        Tokenizer 开始接流量             run_event_loop()  # 直到 ShutdownReq
+                                        finally: 释放 host 资源
+
+    父进程必须等到 ``status=ready`` 才对外服务：模型加载失败时本函数
+    向父进程发 SIGQUIT，而不是让 HTTP 端口先亮绿灯再在第一批请求上崩。
+
+    执行顺序
+    --------
+    1. ``load_plugins()``：让第三方 hook 能替换 Scheduler / worker 类。
+    2. ``publish(..., role="scheduler")``：本进程的运行时上下文必须在
+       任何 bag getter 之前发布；fork 后不能复用父进程的 publish。
+    3. ``configure_scheduler_process``：进程名、日志前缀、affinity、NUMA。
+    4. 可选 OTLP tracing，按 PD 角色区分 Prefill/Decode Scheduler。
+    5. 构造 ``Scheduler``（同步加载模型，可能耗时数分钟）。
+    6. ``pipe_writer.send(get_init_info())``：告诉父进程容量上限和启动耗时。
+    7. ``run_event_loop()``：永久循环，直到 ``ShutdownReq`` 置
+       ``gracefully_exit``。
+    8. 异常：打栈、向父进程 SIGQUIT；可选 ``killpg`` 避免兄弟 rank 在
+       NCCL 超时前喷出大量 traceback。
+    9. finally：关掉 metrics 后台线程；仅优雅退出时 ``release_host_resources``，
+       异常路径 GPU 可能已经卡住，``synchronize()`` 自己也会挂。
+
+    参数含义
+    --------
+    server_args:
+        完整 ``ServerArgs``。子进程通过 ``publish`` 变成进程内全局配置。
+        父进程传入的是一份快照，后续 HTTP 改 CLI 不会穿透到已启动的 rank。
+    port_args:
+        本实例（或本 DP 副本）的 ZMQ IPC 路径和 NCCL 初始化端口。
+        多 DP 时每个副本有自己的 ``PortArgs``，否则 tokenizer 无法把
+        请求送到正确的 Scheduler。
+    gpu_id:
+        本进程绑定的 GPU 逻辑编号，已经过 ``maybe_reindex_device_id``
+        根据 ``CUDA_VISIBLE_DEVICES`` 重映射。``tp_rank`` 不是设备号：
+        多节点 / ``base_gpu_id`` / ``gpu_id_step`` 都会让二者不同。
+    tp_rank:
+        全局张量并行 rank，范围 ``[0, tp_size)``。也是推导 ATTN_CP /
+        MOE_DP / MOE_EP 的主键（见 Engine 的 ``_compute_parallelism_ranks``）。
+    attn_cp_rank:
+        Attention context-parallel rank。把长序列 KV 切到多个 rank；
+        关闭 CP 时为 0。与 ``tp_rank`` 正交：同一 tp_rank 在不同 CP
+        组里仍要能对齐 attention。
+    moe_dp_rank:
+        MoE 数据并行 rank，即 expert mesh 的副本号。和 serving 的
+        ``dp_rank`` 不是同一维度：前者复制专家，后者复制整份调度队列。
+    moe_ep_rank:
+        Expert-parallel rank，专家被切分到哪些卡上。日志里的 ``EP{n}``
+        用的就是它（或下面的 ``display_moe_ep_rank``）。
+    pp_rank:
+        流水线并行阶段。0 收 tokenized 输入并持有 tokenizer ZMQ；
+        最后一阶段产出 logits。PP=1 时永远是 0。
+    dp_rank:
+        数据并行副本 id。Engine 直接 spawn 时传 ``None``（单 DP）；
+        DataParallelController spawn 时传入具体副本号。Router 场景
+        也可能靠 ``SGLANG_DP_RANK`` 在 ``configure_scheduler_process``
+        里补上。
+    pipe_writer:
+        ``mp.Pipe(duplex=False)`` 的写端。子进程只能 send、父进程只能
+        recv。用来回传 ``get_init_info()``，不是业务 token 通道
+        （业务走 ZMQ）。握手失败则父进程永远等不到 ready。
+    display_tp_rank / display_dp_rank / display_moe_ep_rank:
+        仅用于进程名和日志前缀的「对外编号」。Elastic EP、多节点或
+        聚合显示时，本地 rank 与用户看到的 rank 可能不同；运行时
+        集合通信仍用上面那些真实 rank。默认 ``None`` 表示跟运行时
+        rank 一致。
+    """
     # Load plugins so hooks can override Scheduler and its dependencies.
+    # 必须在 publish / 构造 Scheduler 之前：插件可能替换 Scheduler 类本身。
     load_plugins()
     # Publish before anything in this process reads configuration.
+    # fork 后的子进程有自己的 runtime context，不能复用父进程的 publish。
     publish(server_args, role="scheduler")
     dp_rank = configure_scheduler_process(
         server_args,
@@ -5216,6 +5771,7 @@ def run_scheduler_process(
         display_dp_rank=display_dp_rank,
         display_moe_ep_rank=display_moe_ep_rank,
     )
+    # 异常时要主动叫醒还在 pipe.recv() 上阻塞的父进程，否则启动会永久卡住。
     parent_process = psutil.Process().parent()
 
     # Set up tracing
@@ -5233,6 +5789,7 @@ def run_scheduler_process(
         trace_set_thread_info(thread_label, tp_rank, dp_rank, pp_rank)
 
     # Create a scheduler and run the event loop
+    # 构造函数会加载权重并捕获 CUDA Graph，是启动路径上最容易失败的一步。
     scheduler = None
     try:
         scheduler = Scheduler(
@@ -5248,6 +5805,7 @@ def run_scheduler_process(
         )
 
         # Send initialization info back to the parent process
+        # 父进程以此结束握手并决定 Tokenizer 的 max_req_input_len。
         pipe_writer.send(scheduler.get_init_info())
 
         # Run the event loop (blocks until a ShutdownReq sets gracefully_exit)
@@ -5271,6 +5829,7 @@ def run_scheduler_process(
             scheduler.metrics_reporter._shutdown_fpm()
             # Graceful path only: on the exception path the GPU may be wedged
             # and the synchronize() in destroy() could itself hang.
+            # 异常路径不做 GPU synchronize：设备可能已经 hang，释放反而死锁。
             if scheduler.gracefully_exit:
                 scheduler.release_host_resources()
 
@@ -5278,6 +5837,11 @@ def run_scheduler_process(
 def _make_abort_req(
     req: Req, finished_reason: Optional[FinishReasonDict] = None
 ) -> AbortReq:
+    """构造回给 Tokenizer 的中止消息，带上 weight version 跨度。
+
+    Scheduler 不直接关 HTTP 连接：它只发 AbortReq，由 TokenizerManager
+    把 abort 转成客户端可见的 finish_reason。
+    """
     return AbortReq(
         rid=req.rid,
         finished_reason=finished_reason,
